@@ -1,8 +1,8 @@
-# l402-requests
+# L402-Requests
 
 Auto-paying L402 HTTP client for Python. APIs behind Lightning paywalls just work.
 
-`l402-requests` wraps [httpx](https://www.python-httpx.org/) and automatically handles HTTP 402 responses by paying Lightning invoices and retrying with L402 credentials. It's a drop-in HTTP client where any API behind an L402 paywall "just works."
+`L402-Requests` wraps [httpx](https://www.python-httpx.org/) and automatically handles HTTP 402 responses by paying Lightning invoices and retrying with L402 credentials. It's a drop-in HTTP client where any API behind an L402 paywall "just works."
 
 ## Install
 
@@ -145,7 +145,7 @@ Some servers intentionally use a two-step L402 flow where payment and claim are 
 
 For example, the [Lightning Enable Store](https://store.lightningenable.com) returns a 402 on `POST /checkout`, and after payment you claim the order at `POST /claim` with the L402 credential.
 
-In these cases, `l402-requests` pays the invoice automatically. Use the `spending_log` to retrieve the preimage, then make the claim request:
+In these cases, `L402-Requests` pays the invoice automatically. Use the `spending_log` to retrieve the preimage, then make the claim request:
 
 ```python
 from l402_requests import L402Client, BudgetController
