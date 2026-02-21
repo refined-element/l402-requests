@@ -195,6 +195,26 @@ L402 (formerly LSAT) is a protocol for monetizing APIs with Lightning Network mi
 
 Learn more: [docs.lightningenable.com](https://docs.lightningenable.com)
 
+## Example: MaximumSats API
+
+[MaximumSats](https://maximumsats.com) provides paid Lightning Network APIs including AI DVM, WoT reports, Nostr analysis, and more. Use L402-Requests to automatically pay for these endpoints:
+
+```python
+import l402_requests
+
+# Call MaximumSats AI DVM endpoint — invoice is paid automatically
+response = l402_requests.get("https://maximumsats.com/api/dvm")
+data = response.json()
+```
+
+Set your wallet via environment variable:
+
+```bash
+export STRIKE_API_KEY="your-strike-api-key"
+```
+
+The library automatically handles the L402 payment protocol — you just get the data.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
