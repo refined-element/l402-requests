@@ -33,7 +33,11 @@ dependencies = [
 [project.optional-dependencies]
 nwc = ["secp256k1>=0.14.0", "websockets>=12.0"]
 lnd = ["grpcio>=1.60.0"]
+langchain = ["langchain-core>=0.3.0"]
+crewai = ["crewai>=0.80.0"]
+autogen = ["ag2>=0.6.0"]
 all = ["secp256k1>=0.14.0", "websockets>=12.0", "grpcio>=1.60.0"]
+frameworks = ["langchain-core>=0.3.0", "crewai>=0.80.0", "ag2>=0.6.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23.0", "respx>=0.21.0"]
 
 [project.urls]
