@@ -180,6 +180,51 @@ def fetch_paid_api(url: str) -> str:
     return response.text
 ```
 
+See the full [LangChain integration guide](https://docs.lightningenable.com/tools/langchain).
+
+### AG2 (AutoGen) Tool
+
+```python
+from l402_requests import L402Client, BudgetController
+from autogen import ConversableAgent, register_function
+
+client = L402Client(budget=BudgetController(max_sats_per_request=100))
+
+def fetch_l402_resource(url: str) -> str:
+    """Fetch data from an L402-protected API. Payment is handled automatically."""
+    response = client.get(url)
+    return response.text
+
+assistant = ConversableAgent("assistant", llm_config=llm_config)
+executor = ConversableAgent("executor", human_input_mode="NEVER")
+
+register_function(
+    fetch_l402_resource,
+    caller=assistant,
+    executor=executor,
+    description="Fetch data from an L402-protected API with automatic Lightning payment",
+)
+```
+
+See the full [AG2 integration guide](https://docs.lightningenable.com/tools/autogen).
+
+### CrewAI Tool
+
+```python
+from crewai.tools import tool
+from l402_requests import L402Client, BudgetController
+
+_client = L402Client(budget=BudgetController(max_sats_per_request=100))
+
+@tool("L402 API Fetcher")
+def fetch_l402_api(url: str) -> str:
+    """Fetch data from an L402-protected API. Payment is handled automatically."""
+    response = _client.get(url)
+    return response.text
+```
+
+See the full [CrewAI integration guide](https://docs.lightningenable.com/tools/crewai).
+
 ### Standalone Script
 
 ```python
