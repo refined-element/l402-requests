@@ -6,6 +6,8 @@ import json
 
 import pytest
 
+pytest.importorskip("langchain_core", reason="langchain-core not installed")
+
 from l402_requests.integrations.langchain import L402FetchTool, L402SpendingTool
 
 

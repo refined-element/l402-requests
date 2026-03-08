@@ -6,6 +6,8 @@ import json
 
 import pytest
 
+pytest.importorskip("autogen", reason="ag2 not installed")
+
 from l402_requests.integrations import autogen as autogen_integration
 from l402_requests.integrations.autogen import (
     configure_client,

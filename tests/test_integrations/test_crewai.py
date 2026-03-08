@@ -6,6 +6,8 @@ import json
 
 import pytest
 
+pytest.importorskip("crewai", reason="crewai not installed")
+
 from l402_requests.integrations.crewai import L402GetTool, L402PostTool, L402SpendingTool
 
 
