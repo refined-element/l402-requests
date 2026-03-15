@@ -260,6 +260,10 @@ export STRIKE_API_KEY="your-strike-api-key"
 
 The library automatically handles the L402 payment protocol — you just get the data.
 
+## Agent-to-Agent Commerce
+
+For full agent service discovery, negotiation, and settlement on Nostr, see [le-agent-sdk](https://github.com/refined-element/le-agent-sdk-python) which builds on l402-requests.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
