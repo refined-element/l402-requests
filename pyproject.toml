@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "l402-requests"
-version = "0.1.1"
+version = "0.1.2"
 description = "Auto-paying L402 HTTP client — APIs behind Lightning paywalls just work"
 readme = "README.md"
 license = "MIT"
