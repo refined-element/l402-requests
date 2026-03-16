@@ -165,6 +165,8 @@ See the [full documentation](https://docs.lightningenable.com/tools/l402-request
 
 L402-Requests is the consumer-side complement to the [Lightning Enable MCP Server](https://github.com/refined-element/lightning-enable-mcp). While the MCP server gives AI agents wallet tools, L402-Requests lets your Python code access paid APIs without any agent framework.
 
+Part of [Lightning Enable](https://lightningenable.com) — infrastructure for agent commerce over Lightning. See the [full ecosystem](https://docs.lightningenable.com/getting-started/ecosystem).
+
 ### LangChain Tool
 
 ```python
