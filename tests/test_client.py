@@ -392,6 +392,93 @@ class TestMppClient:
             client.get("https://api.example.com/data")
 
 
+class MockMppNonSatTransport(httpx.BaseTransport):
+    """MPP server with non-sat currency — amount should NOT be used for budget."""
+
+    def __init__(self):
+        self.request_count = 0
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.request_count += 1
+        auth = request.headers.get("authorization", "")
+
+        if auth.startswith("Payment ") and "preimage=" in auth:
+            return httpx.Response(200, json={"data": "mpp paid content"})
+
+        # lnbc10u = 1000 sats in the invoice, but amount/currency say USD
+        return httpx.Response(
+            402,
+            headers={
+                "WWW-Authenticate": 'Payment realm="api.example.com", method="lightning", invoice="lnbc10u1ptest", amount="500", currency="usd"',
+            },
+            json={"error": "Payment Required"},
+        )
+
+
+class MockMppZeroAmountTransport(httpx.BaseTransport):
+    """MPP server returning amount=0 (pay-what-you-want resource)."""
+
+    def __init__(self):
+        self.request_count = 0
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.request_count += 1
+        auth = request.headers.get("authorization", "")
+
+        if auth.startswith("Payment ") and "preimage=" in auth:
+            return httpx.Response(200, json={"data": "mpp paid content"})
+
+        # Zero-amount invoice with explicit amount="0" in MPP header
+        return httpx.Response(
+            402,
+            headers={
+                "WWW-Authenticate": 'Payment realm="api.example.com", method="lightning", invoice="lnbc1ptest", amount="0", currency="sat"',
+            },
+            json={"error": "Payment Required"},
+        )
+
+
+class TestMppCurrencyHandling:
+    def test_non_sat_currency_ignores_mpp_amount(self):
+        """When MPP currency is not 'sat', the amount should not be used for budget/logging."""
+        wallet = MockWallet()
+        transport = MockMppNonSatTransport()
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=transport,
+        )
+
+        response = client.get("https://api.example.com/data")
+
+        assert response.status_code == 200
+        assert len(wallet.paid_invoices) == 1
+        # The invoice amount (1000 sats from lnbc10u) should be used,
+        # not the MPP amount (500 "usd")
+        assert client.spending_log.total_spent() == 1000
+        record = client.spending_log.records[0]
+        assert record.amount_sats == 1000
+
+    def test_zero_amount_still_recorded(self):
+        """amount_sats=0 should still be recorded in spending log (not skipped by truthiness)."""
+        wallet = MockWallet()
+        transport = MockMppZeroAmountTransport()
+        client = L402Client(
+            wallet=wallet,
+            budget=None,  # No budget for this test
+            transport=transport,
+        )
+
+        response = client.get("https://api.example.com/data")
+
+        assert response.status_code == 200
+        # Zero amount should still produce a spending log entry
+        assert len(client.spending_log.records) == 1
+        record = client.spending_log.records[0]
+        assert record.amount_sats == 0
+        assert record.success is True
+
+
 class TestAsyncMppClient:
     @pytest.mark.asyncio
     async def test_auto_pays_mpp_402_and_retries(self):

@@ -67,6 +67,7 @@ class TestParseMppChallenge:
         assert isinstance(result, MppChallenge)
         assert result.invoice == "lnbc100n1pjtest"
         assert result.amount == "100"
+        assert result.currency == "sat"
         assert result.realm == "api.example.com"
         assert result.token_type == "Payment"
 
@@ -96,6 +97,7 @@ class TestParseMppChallenge:
         result = parse_mpp_challenge('Payment method="lightning", invoice="lnbc100n1pjtest"')
         assert result.invoice == "lnbc100n1pjtest"
         assert result.amount is None
+        assert result.currency is None
         assert result.realm is None
 
     def test_frozen(self):
@@ -114,6 +116,17 @@ class TestParseMppChallenge:
         result = parse_mpp_challenge(header)
         assert result.invoice == "lnbc100n1pjtest"
         assert result.amount == "100"
+
+    def test_currency_parsed(self):
+        header = 'Payment method="lightning", invoice="lnbc100n1pjtest", amount="500", currency="usd"'
+        result = parse_mpp_challenge(header)
+        assert result.currency == "usd"
+        assert result.amount == "500"
+
+    def test_currency_absent_is_none(self):
+        header = 'Payment method="lightning", invoice="lnbc100n1pjtest", amount="500"'
+        result = parse_mpp_challenge(header)
+        assert result.currency is None
 
 
 class TestFindL402Challenge:
@@ -166,6 +179,7 @@ class TestFindPaymentChallenge:
         result = find_payment_challenge(headers)
         assert isinstance(result, MppChallenge)
         assert result.amount == "100"
+        assert result.currency == "sat"
         assert result.realm == "api.example.com"
 
     def test_no_valid_header(self):

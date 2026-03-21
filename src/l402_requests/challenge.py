@@ -29,6 +29,7 @@ class MppChallenge:
 
     invoice: str
     amount: str | None = None
+    currency: str | None = None
     realm: str | None = None
 
     @property
@@ -61,6 +62,7 @@ _MPP_CHALLENGE_RE = re.compile(
 )
 
 _MPP_AMOUNT_RE = re.compile(r'amount="(?P<amount>[^"]+)"', re.IGNORECASE)
+_MPP_CURRENCY_RE = re.compile(r'currency="(?P<currency>[^"]+)"', re.IGNORECASE)
 _MPP_REALM_RE = re.compile(r'realm="(?P<realm>[^"]+)"', re.IGNORECASE)
 
 
@@ -126,11 +128,13 @@ def parse_mpp_challenge(header: str | None) -> MppChallenge:
         raise ChallengeParseError(header, "empty invoice")
 
     amount_match = _MPP_AMOUNT_RE.search(header)
+    currency_match = _MPP_CURRENCY_RE.search(header)
     realm_match = _MPP_REALM_RE.search(header)
 
     return MppChallenge(
         invoice=invoice,
         amount=amount_match.group("amount") if amount_match else None,
+        currency=currency_match.group("currency") if currency_match else None,
         realm=realm_match.group("realm") if realm_match else None,
     )
 

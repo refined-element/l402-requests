@@ -90,12 +90,16 @@ class L402Client:
             # Extract amount and check budget
             amount_sats = extract_amount_sats(challenge.invoice)
             # MPP challenges may include an explicit amount when the invoice
-            # is zero-amount.  Use it as a fallback for budget / logging.
+            # is zero-amount.  Use it as a fallback for budget / logging,
+            # but only when the currency is explicitly "sat" (or absent,
+            # which defaults to sats).
             if amount_sats is None and isinstance(challenge, MppChallenge) and challenge.amount:
-                try:
-                    amount_sats = int(challenge.amount)
-                except (ValueError, TypeError):
-                    pass
+                mpp_currency = (challenge.currency or "sat").lower()
+                if mpp_currency == "sat":
+                    try:
+                        amount_sats = int(challenge.amount)
+                    except (ValueError, TypeError):
+                        pass
             parsed_url = urlparse(url)
             domain = parsed_url.hostname or ""
 
@@ -107,7 +111,7 @@ class L402Client:
             try:
                 preimage = wallet.pay_invoice_sync(challenge.invoice)
             except Exception as e:
-                if amount_sats:
+                if amount_sats is not None:
                     self.spending_log.record(
                         domain=domain,
                         path=parsed_url.path,
@@ -120,7 +124,7 @@ class L402Client:
                 raise PaymentFailedError(str(e), challenge.invoice) from e
 
             # Record successful payment
-            if amount_sats:
+            if amount_sats is not None:
                 if self._budget:
                     self._budget.record_payment(amount_sats)
                 self.spending_log.record(
@@ -247,12 +251,16 @@ class AsyncL402Client:
 
         amount_sats = extract_amount_sats(challenge.invoice)
         # MPP challenges may include an explicit amount when the invoice
-        # is zero-amount.  Use it as a fallback for budget / logging.
+        # is zero-amount.  Use it as a fallback for budget / logging,
+        # but only when the currency is explicitly "sat" (or absent,
+        # which defaults to sats).
         if amount_sats is None and isinstance(challenge, MppChallenge) and challenge.amount:
-            try:
-                amount_sats = int(challenge.amount)
-            except (ValueError, TypeError):
-                pass
+            mpp_currency = (challenge.currency or "sat").lower()
+            if mpp_currency == "sat":
+                try:
+                    amount_sats = int(challenge.amount)
+                except (ValueError, TypeError):
+                    pass
         parsed_url = urlparse(url)
         domain = parsed_url.hostname or ""
 
@@ -263,7 +271,7 @@ class AsyncL402Client:
         try:
             preimage = await wallet.pay_invoice(challenge.invoice)
         except Exception as e:
-            if amount_sats:
+            if amount_sats is not None:
                 self.spending_log.record(
                     domain=domain,
                     path=parsed_url.path,
@@ -275,7 +283,7 @@ class AsyncL402Client:
                 raise
             raise PaymentFailedError(str(e), challenge.invoice) from e
 
-        if amount_sats:
+        if amount_sats is not None:
             if self._budget:
                 self._budget.record_payment(amount_sats)
             self.spending_log.record(
