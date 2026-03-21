@@ -10,9 +10,13 @@ from dataclasses import dataclass, field
 
 @dataclass
 class L402Credential:
-    """A cached L402 credential (macaroon + preimage)."""
+    """A cached L402 or MPP credential (macaroon + preimage).
 
-    macaroon: str
+    When macaroon is None, the credential represents an MPP payment
+    and uses the ``Payment`` authorization scheme.
+    """
+
+    macaroon: str | None
     preimage: str
     created_at: float = field(default_factory=time.time)
     expires_at: float | None = None
@@ -24,6 +28,8 @@ class L402Credential:
 
     @property
     def authorization_header(self) -> str:
+        if self.macaroon is None:
+            return f'Payment method="lightning", preimage="{self.preimage}"'
         return f"L402 {self.macaroon}:{self.preimage}"
 
 
@@ -67,7 +73,7 @@ class CredentialCache:
         self,
         domain: str,
         path: str,
-        macaroon: str,
+        macaroon: str | None,
         preimage: str,
         expires_at: float | None = None,
     ) -> L402Credential:

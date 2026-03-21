@@ -20,6 +20,11 @@ Usage:
 """
 
 from l402_requests.budget import BudgetController
+from l402_requests.challenge import (
+    MppChallenge,
+    find_payment_challenge,
+    parse_mpp_challenge,
+)
 from l402_requests.client import AsyncL402Client, L402Client
 from l402_requests.credential_cache import CredentialCache, L402Credential
 from l402_requests.exceptions import (
@@ -49,6 +54,10 @@ __all__ = [
     "AsyncL402Client",
     # Budget
     "BudgetController",
+    # Challenge parsing
+    "MppChallenge",
+    "parse_mpp_challenge",
+    "find_payment_challenge",
     # Wallets
     "WalletBase",
     "StrikeWallet",
