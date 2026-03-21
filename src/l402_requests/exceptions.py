@@ -37,12 +37,12 @@ class InvoiceExpiredError(L402Error):
 
 
 class ChallengeParseError(L402Error):
-    """Failed to parse L402 challenge from WWW-Authenticate header."""
+    """Failed to parse payment challenge from WWW-Authenticate header."""
 
     def __init__(self, header: str, reason: str):
         self.header = header
         self.reason = reason
-        super().__init__(f"Failed to parse L402 challenge: {reason}")
+        super().__init__(f"Failed to parse challenge: {reason}")
 
 
 class NoWalletError(L402Error):

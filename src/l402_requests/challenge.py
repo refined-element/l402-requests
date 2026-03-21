@@ -54,8 +54,9 @@ _CHALLENGE_NOQUOTE_RE = re.compile(
 )
 
 # MPP: Payment method="lightning", invoice="..."
+# Uses lookahead so method and invoice can appear in any order.
 _MPP_CHALLENGE_RE = re.compile(
-    r'Payment\s+.*?method="lightning".*?invoice="(?P<invoice>[^"]+)"',
+    r'Payment\s+(?=.*method="lightning").*invoice="(?P<invoice>[^"]+)"',
     re.IGNORECASE,
 )
 
@@ -98,14 +99,14 @@ def parse_challenge(header: str) -> L402Challenge:
     return L402Challenge(macaroon=macaroon, invoice=invoice)
 
 
-def parse_mpp_challenge(header: str) -> MppChallenge:
+def parse_mpp_challenge(header: str | None) -> MppChallenge:
     """Parse a Payment (MPP) challenge from WWW-Authenticate header.
 
     Supports format:
         Payment realm="...", method="lightning", invoice="...", amount="...", currency="sat"
 
     Args:
-        header: The WWW-Authenticate header value.
+        header: The WWW-Authenticate header value, or None.
 
     Returns:
         Parsed MppChallenge with invoice and optional amount/realm.
@@ -170,5 +171,23 @@ def find_payment_challenge(
     return None
 
 
-# Backward-compatible alias
-find_l402_challenge = find_payment_challenge
+def find_l402_challenge(headers: dict[str, str]) -> L402Challenge | None:
+    """Search response headers for an L402 challenge only.
+
+    This preserves the historical behavior of returning only an L402Challenge
+    (or None) and will never return an MppChallenge.
+    """
+    raw = None
+    if hasattr(headers, "get"):
+        for key in headers:
+            if key.lower() == "www-authenticate":
+                raw = headers[key]
+                break
+
+    if raw is None:
+        return None
+
+    try:
+        return parse_challenge(raw)
+    except ChallengeParseError:
+        return None

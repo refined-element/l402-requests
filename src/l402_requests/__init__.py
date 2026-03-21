@@ -22,6 +22,7 @@ Usage:
 from l402_requests.budget import BudgetController
 from l402_requests.challenge import (
     MppChallenge,
+    find_l402_challenge,
     find_payment_challenge,
     parse_mpp_challenge,
 )
@@ -58,6 +59,7 @@ __all__ = [
     "MppChallenge",
     "parse_mpp_challenge",
     "find_payment_challenge",
+    "find_l402_challenge",
     # Wallets
     "WalletBase",
     "StrikeWallet",

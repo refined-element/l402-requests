@@ -15,7 +15,6 @@ from l402_requests.budget import BudgetController
 from l402_requests.challenge import MppChallenge, find_payment_challenge
 from l402_requests.credential_cache import CredentialCache
 from l402_requests.exceptions import (
-    ChallengeParseError,
     L402Error,
     NoWalletError,
     PaymentFailedError,
@@ -90,6 +89,13 @@ class L402Client:
 
             # Extract amount and check budget
             amount_sats = extract_amount_sats(challenge.invoice)
+            # MPP challenges may include an explicit amount when the invoice
+            # is zero-amount.  Use it as a fallback for budget / logging.
+            if amount_sats is None and isinstance(challenge, MppChallenge) and challenge.amount:
+                try:
+                    amount_sats = int(challenge.amount)
+                except (ValueError, TypeError):
+                    pass
             parsed_url = urlparse(url)
             domain = parsed_url.hostname or ""
 
@@ -240,6 +246,13 @@ class AsyncL402Client:
             return response
 
         amount_sats = extract_amount_sats(challenge.invoice)
+        # MPP challenges may include an explicit amount when the invoice
+        # is zero-amount.  Use it as a fallback for budget / logging.
+        if amount_sats is None and isinstance(challenge, MppChallenge) and challenge.amount:
+            try:
+                amount_sats = int(challenge.amount)
+            except (ValueError, TypeError):
+                pass
         parsed_url = urlparse(url)
         domain = parsed_url.hostname or ""
 

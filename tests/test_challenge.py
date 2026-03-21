@@ -86,7 +86,7 @@ class TestParseMppChallenge:
 
     def test_none_header(self):
         with pytest.raises(ChallengeParseError):
-            parse_mpp_challenge(None)  # type: ignore
+            parse_mpp_challenge(None)
 
     def test_whitespace_only_header(self):
         with pytest.raises(ChallengeParseError):
@@ -107,6 +107,13 @@ class TestParseMppChallenge:
         header = 'Payment method="Lightning", invoice="lnbc100n1pjtest"'
         result = parse_mpp_challenge(header)
         assert result.invoice == "lnbc100n1pjtest"
+
+    def test_invoice_before_method(self):
+        """Parameters can appear in any order per RFC 7235."""
+        header = 'Payment invoice="lnbc100n1pjtest", method="lightning", amount="100"'
+        result = parse_mpp_challenge(header)
+        assert result.invoice == "lnbc100n1pjtest"
+        assert result.amount == "100"
 
 
 class TestFindL402Challenge:
@@ -175,18 +182,19 @@ class TestFindPaymentChallenge:
         result = find_payment_challenge({})
         assert result is None
 
-    def test_backward_compat_alias(self):
-        # find_l402_challenge should still work and is the same function
-        from l402_requests.challenge import find_l402_challenge as alias
+    def test_find_l402_challenge_returns_l402_only(self):
+        # find_l402_challenge returns L402Challenge for L402 headers
+        from l402_requests.challenge import find_l402_challenge
 
         headers = {"www-authenticate": 'L402 macaroon="abc", invoice="lnbc100n1pjtest"'}
-        result = alias(headers)
+        result = find_l402_challenge(headers)
         assert isinstance(result, L402Challenge)
+        assert result.macaroon == "abc"
 
-    def test_backward_compat_alias_mpp(self):
-        # find_l402_challenge alias should also find MPP challenges
+    def test_find_l402_challenge_ignores_mpp(self):
+        # find_l402_challenge should NOT return MPP challenges (backward compat)
         from l402_requests.challenge import find_l402_challenge as alias
 
         headers = {"www-authenticate": 'Payment method="lightning", invoice="lnbc100n1pjtest"'}
         result = alias(headers)
-        assert isinstance(result, MppChallenge)
+        assert result is None
