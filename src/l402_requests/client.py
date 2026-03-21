@@ -12,7 +12,7 @@ import httpx
 
 from l402_requests.bolt11 import extract_amount_sats
 from l402_requests.budget import BudgetController
-from l402_requests.challenge import find_l402_challenge
+from l402_requests.challenge import MppChallenge, find_payment_challenge
 from l402_requests.credential_cache import CredentialCache
 from l402_requests.exceptions import (
     L402Error,
@@ -82,13 +82,44 @@ class L402Client:
             if response.status_code != 402:
                 return response
 
-            # Parse L402 challenge
-            challenge = find_l402_challenge(dict(response.headers))
+            # Parse L402 or MPP challenge (prefers L402).
+            # HTTP allows multiple WWW-Authenticate headers; iterate all
+            # values so we don't accidentally discard a valid challenge.
+            www_auth_values = response.headers.get_list("www-authenticate")
+
+            challenge = None
+            if www_auth_values:
+                # Try L402 first (preferred), then MPP
+                sorted_values = sorted(
+                    www_auth_values,
+                    key=lambda v: 0
+                    if v.lower().lstrip().startswith("l402")
+                    else 1,
+                )
+                for value in sorted_values:
+                    candidate = find_payment_challenge(
+                        {"www-authenticate": value}
+                    )
+                    if candidate is not None:
+                        challenge = candidate
+                        break
+
             if challenge is None:
-                return response  # 402 but not L402 — return as-is
+                return response  # 402 but no recognized challenge — return as-is
 
             # Extract amount and check budget
             amount_sats = extract_amount_sats(challenge.invoice)
+            # MPP challenges may include an explicit amount when the invoice
+            # is zero-amount.  Use it as a fallback for budget / logging,
+            # but only when the currency is explicitly "sat" (or absent,
+            # which defaults to sats).
+            if amount_sats is None and isinstance(challenge, MppChallenge) and challenge.amount:
+                mpp_currency = (challenge.currency or "sat").lower()
+                if mpp_currency == "sat":
+                    try:
+                        amount_sats = int(challenge.amount)
+                    except (ValueError, TypeError):
+                        pass
             parsed_url = urlparse(url)
             domain = parsed_url.hostname or ""
 
@@ -100,7 +131,7 @@ class L402Client:
             try:
                 preimage = wallet.pay_invoice_sync(challenge.invoice)
             except Exception as e:
-                if amount_sats:
+                if amount_sats is not None:
                     self.spending_log.record(
                         domain=domain,
                         path=parsed_url.path,
@@ -113,7 +144,7 @@ class L402Client:
                 raise PaymentFailedError(str(e), challenge.invoice) from e
 
             # Record successful payment
-            if amount_sats:
+            if amount_sats is not None:
                 if self._budget:
                     self._budget.record_payment(amount_sats)
                 self.spending_log.record(
@@ -124,17 +155,25 @@ class L402Client:
                     success=True,
                 )
 
-            # Cache the credential
-            self._cache.put(
-                domain=domain,
-                path=parsed_url.path,
-                macaroon=challenge.macaroon,
-                preimage=preimage,
-            )
+            # Cache the credential and reuse its authorization_header
+            # as single source of truth for header formatting.
+            if isinstance(challenge, MppChallenge):
+                cached = self._cache.put(
+                    domain=domain,
+                    path=parsed_url.path,
+                    macaroon=None,
+                    preimage=preimage,
+                )
+            else:
+                cached = self._cache.put(
+                    domain=domain,
+                    path=parsed_url.path,
+                    macaroon=challenge.macaroon,
+                    preimage=preimage,
+                )
 
-            # Retry with L402 authorization
-            auth_header = f"L402 {challenge.macaroon}:{preimage}"
-            headers["Authorization"] = auth_header
+            # Retry with authorization from the cached credential
+            headers["Authorization"] = cached.authorization_header
             retry_response = client.request(method, url, headers=headers, **kwargs)
             return retry_response
 
@@ -222,11 +261,42 @@ class AsyncL402Client:
         if response.status_code != 402:
             return response
 
-        challenge = find_l402_challenge(dict(response.headers))
+        # Parse L402 or MPP challenge (prefers L402).
+        # HTTP allows multiple WWW-Authenticate headers; iterate all
+        # values so we don't accidentally discard a valid challenge.
+        www_auth_values = response.headers.get_list("www-authenticate")
+
+        challenge = None
+        if www_auth_values:
+            sorted_values = sorted(
+                www_auth_values,
+                key=lambda v: 0
+                if v.lower().lstrip().startswith("l402")
+                else 1,
+            )
+            for value in sorted_values:
+                candidate = find_payment_challenge(
+                    {"www-authenticate": value}
+                )
+                if candidate is not None:
+                    challenge = candidate
+                    break
+
         if challenge is None:
             return response
 
         amount_sats = extract_amount_sats(challenge.invoice)
+        # MPP challenges may include an explicit amount when the invoice
+        # is zero-amount.  Use it as a fallback for budget / logging,
+        # but only when the currency is explicitly "sat" (or absent,
+        # which defaults to sats).
+        if amount_sats is None and isinstance(challenge, MppChallenge) and challenge.amount:
+            mpp_currency = (challenge.currency or "sat").lower()
+            if mpp_currency == "sat":
+                try:
+                    amount_sats = int(challenge.amount)
+                except (ValueError, TypeError):
+                    pass
         parsed_url = urlparse(url)
         domain = parsed_url.hostname or ""
 
@@ -237,7 +307,7 @@ class AsyncL402Client:
         try:
             preimage = await wallet.pay_invoice(challenge.invoice)
         except Exception as e:
-            if amount_sats:
+            if amount_sats is not None:
                 self.spending_log.record(
                     domain=domain,
                     path=parsed_url.path,
@@ -249,7 +319,7 @@ class AsyncL402Client:
                 raise
             raise PaymentFailedError(str(e), challenge.invoice) from e
 
-        if amount_sats:
+        if amount_sats is not None:
             if self._budget:
                 self._budget.record_payment(amount_sats)
             self.spending_log.record(
@@ -260,15 +330,25 @@ class AsyncL402Client:
                 success=True,
             )
 
-        self._cache.put(
-            domain=domain,
-            path=parsed_url.path,
-            macaroon=challenge.macaroon,
-            preimage=preimage,
-        )
+        # Cache the credential and reuse its authorization_header
+        # as single source of truth for header formatting.
+        if isinstance(challenge, MppChallenge):
+            cached = self._cache.put(
+                domain=domain,
+                path=parsed_url.path,
+                macaroon=None,
+                preimage=preimage,
+            )
+        else:
+            cached = self._cache.put(
+                domain=domain,
+                path=parsed_url.path,
+                macaroon=challenge.macaroon,
+                preimage=preimage,
+            )
 
-        auth_header = f"L402 {challenge.macaroon}:{preimage}"
-        headers["Authorization"] = auth_header
+        # Retry with authorization from the cached credential
+        headers["Authorization"] = cached.authorization_header
         retry_response = await client.request(method, url, headers=headers, **kwargs)
         return retry_response
 
