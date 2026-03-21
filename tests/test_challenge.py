@@ -128,6 +128,31 @@ class TestParseMppChallenge:
         result = parse_mpp_challenge(header)
         assert result.currency is None
 
+    def test_multiple_challenges_in_one_header(self):
+        """Ensure Payment parsing does not cross into a different auth scheme."""
+        # Payment has method="lightning" and invoice; Bearer follows with its
+        # own realm.  The parser must not pick up Bearer's realm.
+        header = (
+            'Payment method="lightning", invoice="lnbc100n1pjtest", amount="100", currency="sat", '
+            'Bearer realm="other-api"'
+        )
+        result = parse_mpp_challenge(header)
+        assert result.invoice == "lnbc100n1pjtest"
+        assert result.amount == "100"
+        assert result.currency == "sat"
+        # realm should be None — it belongs to the Bearer challenge, not Payment
+        assert result.realm is None
+
+    def test_multiple_challenges_method_in_wrong_scheme(self):
+        """Payment without method="lightning" should fail even if another scheme has it."""
+        # method="lightning" only appears in the Bearer segment, not in Payment.
+        header = (
+            'Payment invoice="lnbc100n1pjtest", amount="100", '
+            'Bearer realm="api", method="lightning"'
+        )
+        with pytest.raises(ChallengeParseError):
+            parse_mpp_challenge(header)
+
 
 class TestFindL402Challenge:
     def test_finds_in_www_authenticate(self):

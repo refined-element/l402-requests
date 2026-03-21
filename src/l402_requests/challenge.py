@@ -55,15 +55,21 @@ _CHALLENGE_NOQUOTE_RE = re.compile(
 )
 
 # MPP: Payment method="lightning", invoice="..."
-# Uses lookahead so method and invoice can appear in any order.
-_MPP_CHALLENGE_RE = re.compile(
-    r'Payment\s+(?=.*method="lightning").*invoice="(?P<invoice>[^"]+)"',
+# First isolate the Payment challenge segment (per RFC 7235), then parse
+# auth-params only from that segment to avoid crossing into other schemes.
+_MPP_SEGMENT_RE = re.compile(
+    r'Payment\s+(?P<params>[^\0]*)',
     re.IGNORECASE,
 )
 
-_MPP_AMOUNT_RE = re.compile(r'amount="(?P<amount>[^"]+)"', re.IGNORECASE)
-_MPP_CURRENCY_RE = re.compile(r'currency="(?P<currency>[^"]+)"', re.IGNORECASE)
-_MPP_REALM_RE = re.compile(r'realm="(?P<realm>[^"]+)"', re.IGNORECASE)
+# A new auth scheme in a combined header looks like: ", SchemeToken "
+# (unquoted alpha token followed by a space, NOT followed by '=').
+_SCHEME_BOUNDARY_RE = re.compile(
+    r',\s*[A-Za-z][A-Za-z0-9!#$&\-^_`|~]*\s+(?![=])',
+)
+
+# Auth-param extractors (applied only to the isolated Payment segment).
+_PARAM_RE = re.compile(r'(\w+)="([^"]*)"', re.IGNORECASE)
 
 
 def parse_challenge(header: str) -> L402Challenge:
@@ -101,11 +107,32 @@ def parse_challenge(header: str) -> L402Challenge:
     return L402Challenge(macaroon=macaroon, invoice=invoice)
 
 
+def _extract_payment_segment(header: str) -> str | None:
+    """Extract the auth-params belonging to the Payment scheme only.
+
+    Per RFC 7235, a WWW-Authenticate header may contain multiple challenges
+    separated by commas.  We locate the ``Payment`` scheme token and then
+    collect everything until the start of the next scheme or end-of-string.
+    """
+    seg_match = _MPP_SEGMENT_RE.search(header)
+    if seg_match is None:
+        return None
+    params_raw = seg_match.group("params")
+    # Truncate at the boundary of the next auth scheme (if any).
+    boundary = _SCHEME_BOUNDARY_RE.search(params_raw)
+    if boundary:
+        params_raw = params_raw[: boundary.start()]
+    return params_raw
+
+
 def parse_mpp_challenge(header: str | None) -> MppChallenge:
     """Parse a Payment (MPP) challenge from WWW-Authenticate header.
 
     Supports format:
         Payment realm="...", method="lightning", invoice="...", amount="...", currency="sat"
+
+    Auth-params may appear in any order.  When multiple challenges coexist
+    in a single header value, only the ``Payment`` segment is considered.
 
     Args:
         header: The WWW-Authenticate header value, or None.
@@ -119,23 +146,27 @@ def parse_mpp_challenge(header: str | None) -> MppChallenge:
     if not header or not header.strip():
         raise ChallengeParseError(header or "", "empty header")
 
-    match = _MPP_CHALLENGE_RE.search(header)
-    if not match:
+    segment = _extract_payment_segment(header)
+    if segment is None:
+        raise ChallengeParseError(header, 'no Payment challenge found')
+
+    # Parse all key="value" pairs from the isolated segment.
+    params: dict[str, str] = {}
+    for m in _PARAM_RE.finditer(segment):
+        params[m.group(1).lower()] = m.group(2)
+
+    if params.get("method", "").lower() != "lightning":
         raise ChallengeParseError(header, 'no Payment method="lightning" challenge found')
 
-    invoice = match.group("invoice")
+    invoice = params.get("invoice", "")
     if not invoice:
         raise ChallengeParseError(header, "empty invoice")
 
-    amount_match = _MPP_AMOUNT_RE.search(header)
-    currency_match = _MPP_CURRENCY_RE.search(header)
-    realm_match = _MPP_REALM_RE.search(header)
-
     return MppChallenge(
         invoice=invoice,
-        amount=amount_match.group("amount") if amount_match else None,
-        currency=currency_match.group("currency") if currency_match else None,
-        realm=realm_match.group("realm") if realm_match else None,
+        amount=params.get("amount"),
+        currency=params.get("currency"),
+        realm=params.get("realm"),
     )
 
 

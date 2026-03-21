@@ -82,8 +82,28 @@ class L402Client:
             if response.status_code != 402:
                 return response
 
-            # Parse L402 or MPP challenge (prefers L402)
-            challenge = find_payment_challenge(dict(response.headers))
+            # Parse L402 or MPP challenge (prefers L402).
+            # HTTP allows multiple WWW-Authenticate headers; iterate all
+            # values so we don't accidentally discard a valid challenge.
+            www_auth_values = response.headers.get_list("www-authenticate")
+
+            challenge = None
+            if www_auth_values:
+                # Try L402 first (preferred), then MPP
+                sorted_values = sorted(
+                    www_auth_values,
+                    key=lambda v: 0
+                    if v.lower().lstrip().startswith("l402")
+                    else 1,
+                )
+                for value in sorted_values:
+                    candidate = find_payment_challenge(
+                        {"www-authenticate": value}
+                    )
+                    if candidate is not None:
+                        challenge = candidate
+                        break
+
             if challenge is None:
                 return response  # 402 but no recognized challenge — return as-is
 
@@ -135,28 +155,25 @@ class L402Client:
                     success=True,
                 )
 
-            # Cache the credential
+            # Cache the credential and reuse its authorization_header
+            # as single source of truth for header formatting.
             if isinstance(challenge, MppChallenge):
-                self._cache.put(
+                cached = self._cache.put(
                     domain=domain,
                     path=parsed_url.path,
                     macaroon=None,
                     preimage=preimage,
                 )
             else:
-                self._cache.put(
+                cached = self._cache.put(
                     domain=domain,
                     path=parsed_url.path,
                     macaroon=challenge.macaroon,
                     preimage=preimage,
                 )
 
-            # Retry with appropriate authorization
-            if isinstance(challenge, MppChallenge):
-                auth_header = f'Payment method="lightning", preimage="{preimage}"'
-            else:
-                auth_header = f"L402 {challenge.macaroon}:{preimage}"
-            headers["Authorization"] = auth_header
+            # Retry with authorization from the cached credential
+            headers["Authorization"] = cached.authorization_header
             retry_response = client.request(method, url, headers=headers, **kwargs)
             return retry_response
 
@@ -244,8 +261,27 @@ class AsyncL402Client:
         if response.status_code != 402:
             return response
 
-        # Parse L402 or MPP challenge (prefers L402)
-        challenge = find_payment_challenge(dict(response.headers))
+        # Parse L402 or MPP challenge (prefers L402).
+        # HTTP allows multiple WWW-Authenticate headers; iterate all
+        # values so we don't accidentally discard a valid challenge.
+        www_auth_values = response.headers.get_list("www-authenticate")
+
+        challenge = None
+        if www_auth_values:
+            sorted_values = sorted(
+                www_auth_values,
+                key=lambda v: 0
+                if v.lower().lstrip().startswith("l402")
+                else 1,
+            )
+            for value in sorted_values:
+                candidate = find_payment_challenge(
+                    {"www-authenticate": value}
+                )
+                if candidate is not None:
+                    challenge = candidate
+                    break
+
         if challenge is None:
             return response
 
@@ -294,28 +330,25 @@ class AsyncL402Client:
                 success=True,
             )
 
-        # Cache the credential
+        # Cache the credential and reuse its authorization_header
+        # as single source of truth for header formatting.
         if isinstance(challenge, MppChallenge):
-            self._cache.put(
+            cached = self._cache.put(
                 domain=domain,
                 path=parsed_url.path,
                 macaroon=None,
                 preimage=preimage,
             )
         else:
-            self._cache.put(
+            cached = self._cache.put(
                 domain=domain,
                 path=parsed_url.path,
                 macaroon=challenge.macaroon,
                 preimage=preimage,
             )
 
-        # Retry with appropriate authorization
-        if isinstance(challenge, MppChallenge):
-            auth_header = f'Payment method="lightning", preimage="{preimage}"'
-        else:
-            auth_header = f"L402 {challenge.macaroon}:{preimage}"
-        headers["Authorization"] = auth_header
+        # Retry with authorization from the cached credential
+        headers["Authorization"] = cached.authorization_header
         retry_response = await client.request(method, url, headers=headers, **kwargs)
         return retry_response
 

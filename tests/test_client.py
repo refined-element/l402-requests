@@ -116,6 +116,35 @@ class MockAsyncMppTransport(httpx.AsyncBaseTransport):
         )
 
 
+class MockMultiHeaderTransport(httpx.BaseTransport):
+    """Returns 402 with separate WWW-Authenticate headers for Bearer and L402.
+
+    Tests that the client iterates all header values instead of losing one
+    when converting to dict.
+    """
+
+    def __init__(self):
+        self.request_count = 0
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.request_count += 1
+        auth = request.headers.get("authorization", "")
+
+        if auth.startswith("L402 "):
+            return httpx.Response(200, json={"data": "paid content"})
+
+        # httpx.Response accepts a list of (name, value) tuples for headers
+        # so we can emit two WWW-Authenticate headers.
+        return httpx.Response(
+            402,
+            headers=[
+                ("WWW-Authenticate", "Bearer realm=test"),
+                ("WWW-Authenticate", 'L402 macaroon="testmacaroon123", invoice="lnbc10u1ptest"'),
+            ],
+            json={"error": "Payment Required"},
+        )
+
+
 class Mock402NoChallenge(httpx.BaseTransport):
     """Returns 402 but without L402 challenge (e.g., Stripe paywall)."""
 
@@ -266,6 +295,25 @@ class TestL402Client:
 
         response = client.post("https://api.example.com/data", json={"key": "value"})
         assert response.status_code == 200
+
+    def test_multiple_www_authenticate_headers(self):
+        """When server sends separate Bearer and L402 WWW-Authenticate headers,
+        the client should find and use the L402 challenge."""
+        wallet = MockWallet()
+        transport = MockMultiHeaderTransport()
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=transport,
+        )
+
+        response = client.get("https://api.example.com/data")
+
+        assert response.status_code == 200
+        assert response.json() == {"data": "paid content"}
+        assert len(wallet.paid_invoices) == 1
+        assert wallet.paid_invoices[0] == "lnbc10u1ptest"
+        assert transport.request_count == 2
 
 
 # ── Async tests ──────────────────────────────────────────────────────────
