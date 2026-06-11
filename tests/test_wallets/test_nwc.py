@@ -1,8 +1,40 @@
 """Tests for NWC wallet adapter."""
 
+import hashlib
+import json
+
 import pytest
 
-from l402_requests.wallets.nwc import NwcWallet
+from l402_requests.wallets.nwc import NwcWallet, verify_nostr_event_signature
+
+# secp256k1 is an optional dependency ([nwc]/[all] extras) and has no pre-built
+# wheel on some platforms (notably Windows without pkg-config + libsecp256k1).
+# The structural-rejection tests below run everywhere (they short-circuit before
+# any crypto import); the positive sign→verify round-trip needs the real library,
+# so it is gated on availability.
+try:
+    import secp256k1 as _secp256k1  # noqa: F401
+
+    HAS_SECP256K1 = True
+except ImportError:  # pragma: no cover - depends on install environment
+    HAS_SECP256K1 = False
+
+
+def _compute_event_id(event: dict) -> str:
+    """NIP-01 event id: SHA256 of the canonical serialization."""
+    serialized = json.dumps(
+        [
+            0,
+            event["pubkey"],
+            event["created_at"],
+            event["kind"],
+            event["tags"],
+            event["content"],
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(serialized.encode()).hexdigest()
 
 
 class TestNwcWallet:
@@ -32,3 +64,164 @@ class TestNwcWallet:
         conn = "nostr+walletconnect://abc123pubkey?relay=wss://relay.example.com&secret=deadbeef1234"
         wallet = NwcWallet(connection_string=conn, timeout=60.0)
         assert wallet._timeout == 60.0
+
+
+class TestNwcResponseSignatureVerification:
+    """Security: kind-23195 NWC response events must be BIP340-sig-verified and
+    pubkey-matched before their content is decrypted/trusted. A malicious relay
+    can otherwise forge a ``pay_invoice``/``get_balance`` response. Mirrors the
+    F-11 fix shipped in the MCP server (v1.12.8)."""
+
+    # ── Structural rejections (run on every platform — no crypto needed) ──
+
+    def test_returns_false_on_empty_event(self):
+        assert verify_nostr_event_signature({}, "a" * 64) is False
+
+    def test_returns_false_on_missing_id(self):
+        assert verify_nostr_event_signature(
+            {
+                "pubkey": "a" * 64,
+                "sig": "b" * 128,
+                "kind": 23195,
+                "created_at": 0,
+                "tags": [],
+                "content": "",
+            },
+            "a" * 64,
+        ) is False
+
+    def test_returns_false_on_missing_pubkey(self):
+        assert verify_nostr_event_signature(
+            {
+                "id": "a" * 64,
+                "sig": "b" * 128,
+                "kind": 23195,
+                "created_at": 0,
+                "tags": [],
+                "content": "",
+            },
+            "a" * 64,
+        ) is False
+
+    def test_returns_false_on_missing_sig(self):
+        assert verify_nostr_event_signature(
+            {
+                "id": "a" * 64,
+                "pubkey": "a" * 64,
+                "kind": 23195,
+                "created_at": 0,
+                "tags": [],
+                "content": "",
+            },
+            "a" * 64,
+        ) is False
+
+    def test_returns_false_on_wrong_field_lengths(self):
+        assert verify_nostr_event_signature(
+            {
+                "id": "abc",  # not 64 hex
+                "pubkey": "a" * 64,
+                "sig": "b" * 128,
+                "kind": 23195,
+                "created_at": 0,
+                "tags": [],
+                "content": "",
+            },
+            "a" * 64,
+        ) is False
+
+    def test_returns_false_on_pubkey_mismatch(self):
+        # Event is internally consistent in shape but its pubkey is NOT the
+        # expected wallet pubkey → reject before any signature math.
+        expected_wallet_pubkey = "a" * 64
+        forged_event = {
+            "id": "0" * 64,
+            "pubkey": "b" * 64,  # WRONG — attacker pubkey
+            "sig": "c" * 128,
+            "kind": 23195,
+            "created_at": 1700000000,
+            "tags": [["e", "x" * 64]],
+            "content": "ciphertext-irrelevant",
+        }
+        assert verify_nostr_event_signature(
+            forged_event, expected_wallet_pubkey
+        ) is False
+
+    @pytest.mark.skipif(
+        not HAS_SECP256K1, reason="secp256k1 ([nwc]/[all] extra) not installed"
+    )
+    def test_returns_false_on_invalid_signature(self):
+        # Pubkey matches the wallet, but the signature is bogus → reject.
+        # fixture-secret-hex is a deterministic 32-byte key for the test only.
+        fixture_privkey_hex = "11" * 32
+        privkey = _secp256k1.PrivateKey(bytes.fromhex(fixture_privkey_hex))
+        pubkey_xonly = privkey.pubkey.serialize(compressed=True)[1:].hex()
+
+        event = {
+            "kind": 23195,
+            "pubkey": pubkey_xonly,
+            "created_at": 1700000000,
+            "tags": [["p", "f" * 64], ["e", "a" * 64]],
+            "content": "ciphertext-irrelevant",
+        }
+        event["id"] = _compute_event_id(event)
+        event["sig"] = "00" * 64  # invalid signature
+
+        assert verify_nostr_event_signature(event, pubkey_xonly) is False
+
+    @pytest.mark.skipif(
+        not HAS_SECP256K1, reason="secp256k1 ([nwc]/[all] extra) not installed"
+    )
+    def test_returns_false_on_tampered_content(self):
+        # A correctly-signed event whose content was mutated after signing must
+        # fail because the recomputed id no longer matches event["id"].
+        fixture_privkey_hex = "22" * 32
+        privkey = _secp256k1.PrivateKey(bytes.fromhex(fixture_privkey_hex))
+        pubkey_xonly = privkey.pubkey.serialize(compressed=True)[1:].hex()
+
+        event = {
+            "kind": 23195,
+            "pubkey": pubkey_xonly,
+            "created_at": 1700000000,
+            "tags": [["p", "f" * 64], ["e", "a" * 64]],
+            "content": "original-ciphertext",
+        }
+        event["id"] = _compute_event_id(event)
+        event["sig"] = privkey.schnorr_sign(
+            bytes.fromhex(event["id"]), bip340tag=None, raw=True
+        ).hex()
+
+        # Relay tampers with the content but keeps the original id+sig.
+        event["content"] = "forged-ciphertext"
+
+        assert verify_nostr_event_signature(event, pubkey_xonly) is False
+
+    @pytest.mark.skipif(
+        not HAS_SECP256K1, reason="secp256k1 ([nwc]/[all] extra) not installed"
+    )
+    def test_accepts_correctly_signed_event_from_expected_wallet(self):
+        # Positive path: an event signed by the expected wallet pubkey passes.
+        fixture_privkey_hex = "33" * 32
+        privkey = _secp256k1.PrivateKey(bytes.fromhex(fixture_privkey_hex))
+        pubkey_xonly = privkey.pubkey.serialize(compressed=True)[1:].hex()
+
+        event = {
+            "kind": 23195,
+            "pubkey": pubkey_xonly,
+            "created_at": 1700000000,
+            "tags": [["p", "f" * 64], ["e", "a" * 64]],
+            "content": "valid-ciphertext",
+        }
+        event["id"] = _compute_event_id(event)
+        event["sig"] = privkey.schnorr_sign(
+            bytes.fromhex(event["id"]), bip340tag=None, raw=True
+        ).hex()
+
+        assert verify_nostr_event_signature(event, pubkey_xonly) is True
+
+
+class TestVersion:
+    def test_version_matches_package_metadata(self):
+        import l402_requests
+
+        assert l402_requests.__version__ == "0.2.0"

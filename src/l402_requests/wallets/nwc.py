@@ -15,6 +15,87 @@ from l402_requests.exceptions import PaymentFailedError
 from l402_requests.wallets import WalletBase
 
 
+def _compute_nostr_event_id(event: dict) -> str:
+    """Compute the NIP-01 event id.
+
+    SHA256 of the canonical serialization ``[0, pubkey, created_at, kind, tags,
+    content]`` (compact JSON, no spaces, unicode preserved).
+    """
+    serialized = json.dumps(
+        [
+            0,
+            event["pubkey"],
+            event["created_at"],
+            event["kind"],
+            event["tags"],
+            event["content"],
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def verify_nostr_event_signature(event: dict, expected_wallet_pubkey: str) -> bool:
+    """Verify a Nostr event came from the expected wallet and is untampered.
+
+    Returns ``True`` only when ALL of the following hold:
+
+    1. ``event["pubkey"]`` equals ``expected_wallet_pubkey`` (case-insensitive).
+    2. The recomputed NIP-01 event id matches ``event["id"]`` — so no field
+       (content, tags, created_at, ...) was altered after signing.
+    3. ``event["sig"]`` is a valid BIP340 Schnorr signature of that id under the
+       claimed x-only ``pubkey``.
+
+    Any malformed input (missing fields, wrong lengths, parse/crypto errors)
+    returns ``False`` defensively. This is the F-11 guard: without it a malicious
+    or compromised relay could forge a ``pay_invoice``/``get_balance`` response
+    that the client would otherwise decrypt and trust. Mirrors the MCP server's
+    ``_verify_nostr_event_signature`` (security audit F-11, MCP v1.12.8).
+    """
+    try:
+        id_hex = event.get("id")
+        pubkey_hex = event.get("pubkey")
+        sig_hex = event.get("sig")
+
+        if (
+            not id_hex
+            or not pubkey_hex
+            or not sig_hex
+            or len(id_hex) != 64
+            or len(pubkey_hex) != 64
+            or len(sig_hex) != 128
+        ):
+            return False
+
+        # Pubkey must be the wallet we're talking to — reject relay-injected
+        # events attributed to some other key before doing any signature math.
+        if not expected_wallet_pubkey or pubkey_hex.lower() != expected_wallet_pubkey.lower():
+            return False
+
+        # Recompute the id from the canonical serialization. Tampering with any
+        # field (including the encrypted content) produces a different id.
+        recomputed_id = _compute_nostr_event_id(event)
+        if recomputed_id.lower() != id_hex.lower():
+            return False
+
+        import secp256k1
+
+        # BIP340 x-only pubkey: prefix the 32-byte x with an (arbitrary) parity
+        # byte to form a 33-byte compressed key; verification drops the parity.
+        pubkey = secp256k1.PublicKey(b"\x02" + bytes.fromhex(pubkey_hex), raw=True)
+        # raw=True → the 32-byte id is used directly as the message (already a
+        # hash; must NOT be re-hashed). bip340tag is ignored when raw=True.
+        return bool(
+            pubkey.schnorr_verify(
+                bytes.fromhex(id_hex), bytes.fromhex(sig_hex), None, raw=True
+            )
+        )
+    except Exception:
+        # Defensive: any parsing/crypto exception → treat as unverified.
+        return False
+
+
 class NwcWallet(WalletBase):
     """Pay invoices via Nostr Wallet Connect (NIP-47).
 
@@ -109,6 +190,17 @@ class NwcWallet(WalletBase):
                     continue
 
                 response_event = msg[2]
+
+                # F-11: verify the response is genuinely from the wallet pubkey
+                # and untampered BEFORE decrypting/trusting its content. A
+                # malicious relay can match the subscription filter and inject a
+                # forged kind-23195 event; the BIP340 signature + pubkey check
+                # rejects it. Drop and keep waiting for a valid response.
+                if not verify_nostr_event_signature(
+                    response_event, self._wallet_pubkey
+                ):
+                    continue
+
                 decrypted = self._nip04_decrypt(
                     privkey, self._wallet_pubkey, response_event["content"]
                 )
