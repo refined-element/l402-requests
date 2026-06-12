@@ -325,6 +325,16 @@ class TestEventIdImplementationsAgree:
 
 class TestVersion:
     def test_version_matches_package_metadata(self):
+        import importlib.metadata
+
         import l402_requests
 
-        assert l402_requests.__version__ == "0.2.0"
+        try:
+            installed_version = importlib.metadata.version("l402-requests")
+        except importlib.metadata.PackageNotFoundError:
+            pytest.skip(
+                "l402-requests is not pip-installed in this environment "
+                "(run `pip install -e .` to exercise this check)"
+            )
+
+        assert l402_requests.__version__ == installed_version
