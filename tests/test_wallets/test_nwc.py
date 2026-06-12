@@ -5,7 +5,12 @@ import json
 
 import pytest
 
-from l402_requests.wallets.nwc import NwcWallet, verify_nostr_event_signature
+from l402_requests.wallets.nwc import (
+    NwcWallet,
+    _compute_nostr_event_id,
+    _normalize_xonly_pubkey,
+    verify_nostr_event_signature,
+)
 
 # secp256k1 is an optional dependency ([nwc]/[all] extras) and has no pre-built
 # wheel on some platforms (notably Windows without pkg-config + libsecp256k1).
@@ -218,6 +223,104 @@ class TestNwcResponseSignatureVerification:
         ).hex()
 
         assert verify_nostr_event_signature(event, pubkey_xonly) is True
+
+    @pytest.mark.skipif(
+        not HAS_SECP256K1, reason="secp256k1 ([nwc]/[all] extra) not installed"
+    )
+    def test_accepts_when_expected_pubkey_is_compressed_form(self):
+        # A caller may pass the wallet pubkey in COMPRESSED form (66 hex with an
+        # 02/03 parity prefix — the same form this module accepts in its NIP-04
+        # encrypt/decrypt paths). The event itself carries the 64-hex x-only
+        # pubkey (per NIP-01). The verifier must normalize the compressed
+        # expected key to x-only before comparing, otherwise a legitimate,
+        # correctly-signed wallet response is wrongly rejected and pay_invoice
+        # times out. Show that the compressed form is ACCEPTED.
+        fixture_privkey_hex = "44" * 32
+        privkey = _secp256k1.PrivateKey(bytes.fromhex(fixture_privkey_hex))
+        pubkey_compressed = privkey.pubkey.serialize(compressed=True).hex()
+        pubkey_xonly = pubkey_compressed[2:]
+        assert len(pubkey_compressed) == 66
+        assert len(pubkey_xonly) == 64
+
+        event = {
+            "kind": 23195,
+            "pubkey": pubkey_xonly,  # event carries x-only, per NIP-01
+            "created_at": 1700000000,
+            "tags": [["p", "f" * 64], ["e", "a" * 64]],
+            "content": "valid-ciphertext",
+        }
+        event["id"] = _compute_event_id(event)
+        event["sig"] = privkey.schnorr_sign(
+            bytes.fromhex(event["id"]), bip340tag=None, raw=True
+        ).hex()
+
+        # Caller passes the COMPRESSED form → must still be accepted.
+        assert verify_nostr_event_signature(event, pubkey_compressed) is True
+
+
+class TestNormalizeXonlyPubkey:
+    """The pubkey-normalization helper underpinning the compressed-form accept
+    above. Pure string logic — runs on every platform (no crypto needed), so it
+    is the deterministic red→green proof for the Copilot 'normalize before
+    compare' finding."""
+
+    def test_compressed_02_prefix_is_stripped_to_xonly(self):
+        xonly = "a" * 64
+        assert _normalize_xonly_pubkey("02" + xonly) == xonly
+
+    def test_compressed_03_prefix_is_stripped_to_xonly(self):
+        xonly = "b" * 64
+        assert _normalize_xonly_pubkey("03" + xonly) == xonly
+
+    def test_xonly_is_returned_unchanged(self):
+        xonly = "c" * 64
+        assert _normalize_xonly_pubkey(xonly) == xonly
+
+    def test_normalization_is_case_insensitive_lowercased(self):
+        # Mixed-case compressed in → lowercased x-only out, so the downstream
+        # comparison is a clean case-insensitive match.
+        assert _normalize_xonly_pubkey("02" + "AbCd" * 16) == ("abcd" * 16)
+
+    def test_other_lengths_returned_lowercased_unchanged(self):
+        # Not 64/66 hex → don't guess; just lowercase and let the caller's
+        # length/equality checks reject it.
+        assert _normalize_xonly_pubkey("XYZ") == "xyz"
+        assert _normalize_xonly_pubkey("") == ""
+
+
+class TestEventIdImplementationsAgree:
+    """The signing path (NwcWallet._compute_event_id) and the verification path
+    (_compute_nostr_event_id) must use the SAME NIP-01 canonical serialization
+    so sign/verify can never diverge. Copilot flagged the duplication; this
+    pins them to identical output."""
+
+    def test_signing_and_verifying_id_helpers_match(self):
+        event = {
+            "kind": 23194,
+            "pubkey": "d" * 64,
+            "created_at": 1700000123,
+            "tags": [["p", "e" * 64], ["e", "a" * 64]],
+            "content": "some-encrypted-content?iv=AAAA",
+        }
+        # Both the module-level verification helper and the wallet's signing
+        # helper must produce the same id for the same event.
+        assert _compute_nostr_event_id(event) == NwcWallet._compute_event_id(event)
+
+    def test_id_from_signing_path_verifies_via_verification_serialization(self):
+        # The id the signing path computes is exactly the id the verification
+        # path recomputes — proving an event signed over the signing-path id is
+        # checked against the identical serialization on verify.
+        event = {
+            "kind": 23195,
+            "pubkey": "f" * 64,
+            "created_at": 1700000456,
+            "tags": [["p", "1" * 64]],
+            "content": "ciphertext?iv=BBBB",
+        }
+        signed_id = NwcWallet._compute_event_id(event)
+        event["id"] = signed_id
+        recomputed_id = _compute_nostr_event_id(event)
+        assert recomputed_id == signed_id
 
 
 class TestVersion:

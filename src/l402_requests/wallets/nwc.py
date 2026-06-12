@@ -16,10 +16,14 @@ from l402_requests.wallets import WalletBase
 
 
 def _compute_nostr_event_id(event: dict) -> str:
-    """Compute the NIP-01 event id.
+    """Compute the NIP-01 event id (single canonical implementation).
 
     SHA256 of the canonical serialization ``[0, pubkey, created_at, kind, tags,
     content]`` (compact JSON, no spaces, unicode preserved).
+
+    This is the ONE event-id implementation used by both the signing path
+    (``NwcWallet._compute_event_id`` delegates here) and the verification path
+    (``verify_nostr_event_signature``), so the two can never diverge.
     """
     serialized = json.dumps(
         [
@@ -34,6 +38,23 @@ def _compute_nostr_event_id(event: dict) -> str:
         ensure_ascii=False,
     )
     return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _normalize_xonly_pubkey(pubkey_hex: str) -> str:
+    """Normalize a secp256k1 pubkey to its lowercase 64-hex x-only form.
+
+    A caller may hand us the wallet pubkey in *compressed* form (66 hex chars
+    with an ``02``/``03`` parity-byte prefix — the same form this module already
+    accepts in its NIP-04 encrypt/decrypt paths). Nostr events (NIP-01) always
+    carry the 32-byte **x-only** pubkey (64 hex). To compare the two correctly we
+    drop the parity prefix from a 66-hex compressed key. Anything else is
+    returned lowercased and unchanged so the caller's own length/equality checks
+    can reject malformed input.
+    """
+    normalized = (pubkey_hex or "").lower()
+    if len(normalized) == 66 and normalized[:2] in ("02", "03"):
+        return normalized[2:]
+    return normalized
 
 
 def verify_nostr_event_signature(event: dict, expected_wallet_pubkey: str) -> bool:
@@ -70,7 +91,13 @@ def verify_nostr_event_signature(event: dict, expected_wallet_pubkey: str) -> bo
 
         # Pubkey must be the wallet we're talking to — reject relay-injected
         # events attributed to some other key before doing any signature math.
-        if not expected_wallet_pubkey or pubkey_hex.lower() != expected_wallet_pubkey.lower():
+        # Normalize the expected key first: a caller may pass it in compressed
+        # (66-hex, 02/03-prefixed) form, while the event carries the 64-hex
+        # x-only pubkey. Without normalizing, a legitimate wallet response would
+        # be wrongly rejected and pay_invoice would time out.
+        if not expected_wallet_pubkey:
+            return False
+        if pubkey_hex.lower() != _normalize_xonly_pubkey(expected_wallet_pubkey):
             return False
 
         # Recompute the id from the canonical serialization. Tampering with any
@@ -296,20 +323,13 @@ class NwcWallet(WalletBase):
 
     @staticmethod
     def _compute_event_id(event: dict) -> str:
-        """Compute NIP-01 event ID."""
-        serialized = json.dumps(
-            [
-                0,
-                event["pubkey"],
-                event["created_at"],
-                event["kind"],
-                event["tags"],
-                event["content"],
-            ],
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
-        return hashlib.sha256(serialized.encode()).hexdigest()
+        """Compute NIP-01 event ID.
+
+        Delegates to the module-level :func:`_compute_nostr_event_id` so the
+        signing path and the verification path share ONE canonical
+        serialization and can never diverge.
+        """
+        return _compute_nostr_event_id(event)
 
     @staticmethod
     def _sign_event(privkey, event_id_hex: str) -> str:
