@@ -15,6 +15,114 @@ from l402_requests.exceptions import PaymentFailedError
 from l402_requests.wallets import WalletBase
 
 
+def _compute_nostr_event_id(event: dict) -> str:
+    """Compute the NIP-01 event id (single canonical implementation).
+
+    SHA256 of the canonical serialization ``[0, pubkey, created_at, kind, tags,
+    content]`` (compact JSON, no spaces, unicode preserved).
+
+    This is the ONE event-id implementation used by both the signing path
+    (``NwcWallet._compute_event_id`` delegates here) and the verification path
+    (``verify_nostr_event_signature``), so the two can never diverge.
+    """
+    serialized = json.dumps(
+        [
+            0,
+            event["pubkey"],
+            event["created_at"],
+            event["kind"],
+            event["tags"],
+            event["content"],
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _normalize_xonly_pubkey(pubkey_hex: str) -> str:
+    """Normalize a secp256k1 pubkey to its lowercase 64-hex x-only form.
+
+    A caller may hand us the wallet pubkey in *compressed* form (66 hex chars
+    with an ``02``/``03`` parity-byte prefix — the same form this module already
+    accepts in its NIP-04 encrypt/decrypt paths). Nostr events (NIP-01) always
+    carry the 32-byte **x-only** pubkey (64 hex). To compare the two correctly we
+    drop the parity prefix from a 66-hex compressed key. Anything else is
+    returned lowercased and unchanged so the caller's own length/equality checks
+    can reject malformed input.
+    """
+    normalized = (pubkey_hex or "").lower()
+    if len(normalized) == 66 and normalized[:2] in ("02", "03"):
+        return normalized[2:]
+    return normalized
+
+
+def verify_nostr_event_signature(event: dict, expected_wallet_pubkey: str) -> bool:
+    """Verify a Nostr event came from the expected wallet and is untampered.
+
+    Returns ``True`` only when ALL of the following hold:
+
+    1. ``event["pubkey"]`` equals ``expected_wallet_pubkey`` (case-insensitive).
+    2. The recomputed NIP-01 event id matches ``event["id"]`` — so no field
+       (content, tags, created_at, ...) was altered after signing.
+    3. ``event["sig"]`` is a valid BIP340 Schnorr signature of that id under the
+       claimed x-only ``pubkey``.
+
+    Any malformed input (missing fields, wrong lengths, parse/crypto errors)
+    returns ``False`` defensively. This is the F-11 guard: without it a malicious
+    or compromised relay could forge a ``pay_invoice``/``get_balance`` response
+    that the client would otherwise decrypt and trust. Mirrors the MCP server's
+    ``_verify_nostr_event_signature`` (security audit F-11, MCP v1.12.8).
+    """
+    try:
+        id_hex = event.get("id")
+        pubkey_hex = event.get("pubkey")
+        sig_hex = event.get("sig")
+
+        if (
+            not id_hex
+            or not pubkey_hex
+            or not sig_hex
+            or len(id_hex) != 64
+            or len(pubkey_hex) != 64
+            or len(sig_hex) != 128
+        ):
+            return False
+
+        # Pubkey must be the wallet we're talking to — reject relay-injected
+        # events attributed to some other key before doing any signature math.
+        # Normalize the expected key first: a caller may pass it in compressed
+        # (66-hex, 02/03-prefixed) form, while the event carries the 64-hex
+        # x-only pubkey. Without normalizing, a legitimate wallet response would
+        # be wrongly rejected and pay_invoice would time out.
+        if not expected_wallet_pubkey:
+            return False
+        if pubkey_hex.lower() != _normalize_xonly_pubkey(expected_wallet_pubkey):
+            return False
+
+        # Recompute the id from the canonical serialization. Tampering with any
+        # field (including the encrypted content) produces a different id.
+        recomputed_id = _compute_nostr_event_id(event)
+        if recomputed_id.lower() != id_hex.lower():
+            return False
+
+        import secp256k1
+
+        # BIP340 x-only pubkey: prefix the 32-byte x with an (arbitrary) parity
+        # byte to form a 33-byte compressed key; verification drops the parity.
+        pubkey = secp256k1.PublicKey(b"\x02" + bytes.fromhex(pubkey_hex), raw=True)
+        # raw=True → the 32-byte id is used directly as the message (already a
+        # hash; must NOT be re-hashed). bip340tag is ignored when raw=True.
+        return bool(
+            pubkey.schnorr_verify(
+                bytes.fromhex(id_hex), bytes.fromhex(sig_hex), None, raw=True
+            )
+        )
+    except Exception:
+        # Defensive: any parsing/crypto exception → treat as unverified.
+        return False
+
+
 class NwcWallet(WalletBase):
     """Pay invoices via Nostr Wallet Connect (NIP-47).
 
@@ -109,6 +217,17 @@ class NwcWallet(WalletBase):
                     continue
 
                 response_event = msg[2]
+
+                # F-11: verify the response is genuinely from the wallet pubkey
+                # and untampered BEFORE decrypting/trusting its content. A
+                # malicious relay can match the subscription filter and inject a
+                # forged kind-23195 event; the BIP340 signature + pubkey check
+                # rejects it. Drop and keep waiting for a valid response.
+                if not verify_nostr_event_signature(
+                    response_event, self._wallet_pubkey
+                ):
+                    continue
+
                 decrypted = self._nip04_decrypt(
                     privkey, self._wallet_pubkey, response_event["content"]
                 )
@@ -204,20 +323,13 @@ class NwcWallet(WalletBase):
 
     @staticmethod
     def _compute_event_id(event: dict) -> str:
-        """Compute NIP-01 event ID."""
-        serialized = json.dumps(
-            [
-                0,
-                event["pubkey"],
-                event["created_at"],
-                event["kind"],
-                event["tags"],
-                event["content"],
-            ],
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
-        return hashlib.sha256(serialized.encode()).hexdigest()
+        """Compute NIP-01 event ID.
+
+        Delegates to the module-level :func:`_compute_nostr_event_id` so the
+        signing path and the verification path share ONE canonical
+        serialization and can never diverge.
+        """
+        return _compute_nostr_event_id(event)
 
     @staticmethod
     def _sign_event(privkey, event_id_hex: str) -> str:
