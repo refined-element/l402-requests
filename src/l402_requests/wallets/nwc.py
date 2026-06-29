@@ -171,18 +171,30 @@ class NwcWallet(WalletBase):
 
     def __init__(self, connection_string: str, timeout: float = 30.0):
         parsed = urlparse(connection_string)
-        self._wallet_pubkey = parsed.hostname or parsed.netloc
+        raw_pubkey = parsed.hostname or parsed.netloc
         params = parse_qs(parsed.query)
         self._relay = params.get("relay", [None])[0]
         self._secret = params.get("secret", [None])[0]
         self._timeout = timeout
 
-        if not self._wallet_pubkey:
+        if not raw_pubkey:
             raise ValueError("NWC connection string missing wallet pubkey")
         if not self._relay:
             raise ValueError("NWC connection string missing relay URL")
         if not self._secret:
             raise ValueError("NWC connection string missing secret")
+
+        # Some NWC URIs ship the wallet pubkey in 66-hex COMPRESSED form
+        # (02/03 parity-byte prefix); NIP-01 events carry the 64-hex x-only
+        # form. Normalize once at construction time so every downstream use
+        # (NIP-04 ECDH key, "p" tag on the kind-23194 request, wallet→client
+        # response verification) sees the same canonical x-only key. The
+        # verifier already tolerates compressed input on the EXPECTED-pubkey
+        # side via _normalize_xonly_pubkey, but the send path used the raw
+        # value and would embed the compressed key into the wire event — some
+        # relays/wallets reject that, and the shared-X math would silently
+        # use a different key from what the wallet uses.
+        self._wallet_pubkey = _normalize_xonly_pubkey(raw_pubkey)
 
     async def pay_invoice(self, bolt11: str) -> str:
         """Pay via NWC protocol (NIP-47 pay_invoice)."""

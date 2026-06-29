@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from l402_requests.wallets import WalletBase
 from l402_requests.wallets.lnd import LndWallet
+from l402_requests.wallets.nwc import NwcWallet
 from l402_requests.wallets.opennode import OpenNodeWallet
 from l402_requests.wallets.strike import StrikeWallet
 
@@ -29,6 +30,20 @@ def test_lnd_supports_preimage():
     assert wallet.supports_preimage is True
 
 
+def test_nwc_supports_preimage():
+    # NwcWallet needs a valid-looking NWC URI to construct; the values are
+    # only structural — no network call is made here.
+    wallet = NwcWallet(
+        connection_string=(
+            "nostr+walletconnect://"
+            + "0" * 64
+            + "?relay=wss://example.com&secret="
+            + "1" * 64
+        )
+    )
+    assert wallet.supports_preimage is True
+
+
 def test_opennode_does_not_support_preimage():
     wallet = OpenNodeWallet(api_key="test")
     assert wallet.supports_preimage is False
@@ -38,4 +53,5 @@ def test_attribute_accessible_via_class_not_only_instance():
     """Lets callers branch on capability without constructing the wallet."""
     assert StrikeWallet.supports_preimage is True
     assert LndWallet.supports_preimage is True
+    assert NwcWallet.supports_preimage is True
     assert OpenNodeWallet.supports_preimage is False
