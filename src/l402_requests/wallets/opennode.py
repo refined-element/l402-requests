@@ -18,6 +18,8 @@ class OpenNodeWallet(WalletBase):
     Strike, LND, or compatible NWC wallets.
     """
 
+    supports_preimage: bool = False
+
     BASE_URL = "https://api.opennode.com"
 
     def __init__(self, api_key: str, base_url: str | None = None):

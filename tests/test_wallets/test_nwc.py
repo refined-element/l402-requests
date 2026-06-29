@@ -8,21 +8,16 @@ import pytest
 from l402_requests.wallets.nwc import (
     NwcWallet,
     _compute_nostr_event_id,
+    _derive_xonly_pubkey,
     _normalize_xonly_pubkey,
     verify_nostr_event_signature,
 )
 
-# secp256k1 is an optional dependency ([nwc]/[all] extras) and has no pre-built
-# wheel on some platforms (notably Windows without pkg-config + libsecp256k1).
-# The structural-rejection tests below run everywhere (they short-circuit before
-# any crypto import); the positive sign→verify round-trip needs the real library,
-# so it is gated on availability.
-try:
-    import secp256k1 as _secp256k1  # noqa: F401
-
-    HAS_SECP256K1 = True
-except ImportError:  # pragma: no cover - depends on install environment
-    HAS_SECP256K1 = False
+# coincurve is a BASE dependency of this package — ships prebuilt wheels for
+# Linux, macOS, and Windows, so there is no platform-conditional skip path here
+# anymore (the old `[nwc]` extra that gated `secp256k1` is dead). If this import
+# fails, treat it as a real packaging regression — these tests SHOULD fail loudly.
+import coincurve as _coincurve  # noqa: F401
 
 
 def _compute_event_id(event: dict) -> str:
@@ -44,14 +39,16 @@ def _compute_event_id(event: dict) -> str:
 
 class TestNwcWallet:
     def test_parses_connection_string(self):
-        conn = "nostr+walletconnect://abc123pubkey?relay=wss://relay.example.com&secret=deadbeef1234"
+        conn = "nostr+walletconnect://abc123pubkey?relay=wss://relay.example.com&secret=deadbeef1234deadbeef1234deadbeef1234deadbeef1234deadbeef12345678"
         wallet = NwcWallet(connection_string=conn)
         assert wallet._wallet_pubkey == "abc123pubkey"
         assert wallet._relay == "wss://relay.example.com"
-        assert wallet._secret == "deadbeef1234"
+        assert wallet._secret == (
+            "deadbeef1234deadbeef1234deadbeef1234deadbeef1234deadbeef12345678"
+        )
 
     def test_missing_relay_raises(self):
-        conn = "nostr+walletconnect://abc123pubkey?secret=deadbeef1234"
+        conn = "nostr+walletconnect://abc123pubkey?secret=deadbeef1234deadbeef1234deadbeef1234deadbeef1234deadbeef12345678"
         with pytest.raises(ValueError, match="missing relay"):
             NwcWallet(connection_string=conn)
 
@@ -61,12 +58,12 @@ class TestNwcWallet:
             NwcWallet(connection_string=conn)
 
     def test_missing_pubkey_raises(self):
-        conn = "nostr+walletconnect://?relay=wss://relay.example.com&secret=deadbeef1234"
+        conn = "nostr+walletconnect://?relay=wss://relay.example.com&secret=deadbeef1234deadbeef1234deadbeef1234deadbeef1234deadbeef12345678"
         with pytest.raises(ValueError, match="missing wallet pubkey"):
             NwcWallet(connection_string=conn)
 
     def test_custom_timeout(self):
-        conn = "nostr+walletconnect://abc123pubkey?relay=wss://relay.example.com&secret=deadbeef1234"
+        conn = "nostr+walletconnect://abc123pubkey?relay=wss://relay.example.com&secret=deadbeef1234deadbeef1234deadbeef1234deadbeef1234deadbeef12345678"
         wallet = NwcWallet(connection_string=conn, timeout=60.0)
         assert wallet._timeout == 60.0
 
@@ -152,15 +149,12 @@ class TestNwcResponseSignatureVerification:
             forged_event, expected_wallet_pubkey
         ) is False
 
-    @pytest.mark.skipif(
-        not HAS_SECP256K1, reason="secp256k1 ([nwc]/[all] extra) not installed"
-    )
     def test_returns_false_on_invalid_signature(self):
         # Pubkey matches the wallet, but the signature is bogus → reject.
         # fixture-secret-hex is a deterministic 32-byte key for the test only.
         fixture_privkey_hex = "11" * 32
-        privkey = _secp256k1.PrivateKey(bytes.fromhex(fixture_privkey_hex))
-        pubkey_xonly = privkey.pubkey.serialize(compressed=True)[1:].hex()
+        privkey = _coincurve.PrivateKey(bytes.fromhex(fixture_privkey_hex))
+        pubkey_xonly = privkey.public_key.format(compressed=True)[1:33].hex()
 
         event = {
             "kind": 23195,
@@ -174,15 +168,12 @@ class TestNwcResponseSignatureVerification:
 
         assert verify_nostr_event_signature(event, pubkey_xonly) is False
 
-    @pytest.mark.skipif(
-        not HAS_SECP256K1, reason="secp256k1 ([nwc]/[all] extra) not installed"
-    )
     def test_returns_false_on_tampered_content(self):
         # A correctly-signed event whose content was mutated after signing must
         # fail because the recomputed id no longer matches event["id"].
         fixture_privkey_hex = "22" * 32
-        privkey = _secp256k1.PrivateKey(bytes.fromhex(fixture_privkey_hex))
-        pubkey_xonly = privkey.pubkey.serialize(compressed=True)[1:].hex()
+        privkey = _coincurve.PrivateKey(bytes.fromhex(fixture_privkey_hex))
+        pubkey_xonly = privkey.public_key.format(compressed=True)[1:33].hex()
 
         event = {
             "kind": 23195,
@@ -192,23 +183,18 @@ class TestNwcResponseSignatureVerification:
             "content": "original-ciphertext",
         }
         event["id"] = _compute_event_id(event)
-        event["sig"] = privkey.schnorr_sign(
-            bytes.fromhex(event["id"]), bip340tag=None, raw=True
-        ).hex()
+        event["sig"] = privkey.sign_schnorr(bytes.fromhex(event["id"])).hex()
 
         # Relay tampers with the content but keeps the original id+sig.
         event["content"] = "forged-ciphertext"
 
         assert verify_nostr_event_signature(event, pubkey_xonly) is False
 
-    @pytest.mark.skipif(
-        not HAS_SECP256K1, reason="secp256k1 ([nwc]/[all] extra) not installed"
-    )
     def test_accepts_correctly_signed_event_from_expected_wallet(self):
         # Positive path: an event signed by the expected wallet pubkey passes.
         fixture_privkey_hex = "33" * 32
-        privkey = _secp256k1.PrivateKey(bytes.fromhex(fixture_privkey_hex))
-        pubkey_xonly = privkey.pubkey.serialize(compressed=True)[1:].hex()
+        privkey = _coincurve.PrivateKey(bytes.fromhex(fixture_privkey_hex))
+        pubkey_xonly = privkey.public_key.format(compressed=True)[1:33].hex()
 
         event = {
             "kind": 23195,
@@ -218,15 +204,10 @@ class TestNwcResponseSignatureVerification:
             "content": "valid-ciphertext",
         }
         event["id"] = _compute_event_id(event)
-        event["sig"] = privkey.schnorr_sign(
-            bytes.fromhex(event["id"]), bip340tag=None, raw=True
-        ).hex()
+        event["sig"] = privkey.sign_schnorr(bytes.fromhex(event["id"])).hex()
 
         assert verify_nostr_event_signature(event, pubkey_xonly) is True
 
-    @pytest.mark.skipif(
-        not HAS_SECP256K1, reason="secp256k1 ([nwc]/[all] extra) not installed"
-    )
     def test_accepts_when_expected_pubkey_is_compressed_form(self):
         # A caller may pass the wallet pubkey in COMPRESSED form (66 hex with an
         # 02/03 parity prefix — the same form this module accepts in its NIP-04
@@ -236,8 +217,8 @@ class TestNwcResponseSignatureVerification:
         # correctly-signed wallet response is wrongly rejected and pay_invoice
         # times out. Show that the compressed form is ACCEPTED.
         fixture_privkey_hex = "44" * 32
-        privkey = _secp256k1.PrivateKey(bytes.fromhex(fixture_privkey_hex))
-        pubkey_compressed = privkey.pubkey.serialize(compressed=True).hex()
+        privkey = _coincurve.PrivateKey(bytes.fromhex(fixture_privkey_hex))
+        pubkey_compressed = privkey.public_key.format(compressed=True).hex()
         pubkey_xonly = pubkey_compressed[2:]
         assert len(pubkey_compressed) == 66
         assert len(pubkey_xonly) == 64
@@ -250,9 +231,7 @@ class TestNwcResponseSignatureVerification:
             "content": "valid-ciphertext",
         }
         event["id"] = _compute_event_id(event)
-        event["sig"] = privkey.schnorr_sign(
-            bytes.fromhex(event["id"]), bip340tag=None, raw=True
-        ).hex()
+        event["sig"] = privkey.sign_schnorr(bytes.fromhex(event["id"])).hex()
 
         # Caller passes the COMPRESSED form → must still be accepted.
         assert verify_nostr_event_signature(event, pubkey_compressed) is True
@@ -321,6 +300,74 @@ class TestEventIdImplementationsAgree:
         event["id"] = signed_id
         recomputed_id = _compute_nostr_event_id(event)
         assert recomputed_id == signed_id
+
+
+class TestNip04RoundTrip:
+    """Encrypt + decrypt round-trip through the same code path.
+
+    Proves the coincurve ECDH math is symmetric end-to-end and that
+    ``_nip04_encrypt`` / ``_nip04_decrypt`` agree on the raw shared-X as
+    the AES-256-CBC key. This is the canary that catches a regression in
+    the NIP-04 wire format the next time the curve library or shared-key
+    derivation is touched — the secp256k1 → coincurve swap was exactly
+    that kind of change, and the wallet wouldn't even ack a kind-23194
+    request if the two halves drifted.
+    """
+
+    def test_encrypt_then_decrypt_round_trips(self):
+        # Deterministic test keys (NOT real wallet creds).
+        sender_secret = bytes.fromhex("11" * 32)
+        recipient_secret = bytes.fromhex("22" * 32)
+        sender_pubkey = _derive_xonly_pubkey(sender_secret)
+        recipient_pubkey = _derive_xonly_pubkey(recipient_secret)
+
+        plaintext = '{"method":"pay_invoice","params":{"invoice":"lnbc..."}}'
+
+        # Sender → recipient
+        ciphertext = NwcWallet._nip04_encrypt(
+            sender_secret, recipient_pubkey, plaintext
+        )
+        assert "?iv=" in ciphertext
+
+        # Recipient decrypts using its own secret + sender's pubkey
+        decrypted = NwcWallet._nip04_decrypt(
+            recipient_secret, sender_pubkey, ciphertext
+        )
+        assert decrypted == plaintext
+
+    def test_decrypt_rejects_malformed_ciphertext(self):
+        # The decrypt path now validates the ``?iv=`` delimiter explicitly
+        # instead of letting an IndexError surface from str.split. A
+        # malformed wallet response should produce a clear ValueError.
+        recipient_secret = bytes.fromhex("22" * 32)
+        sender_pubkey = _derive_xonly_pubkey(bytes.fromhex("11" * 32))
+
+        with pytest.raises(ValueError, match="NIP-04 ciphertext"):
+            NwcWallet._nip04_decrypt(recipient_secret, sender_pubkey, "no-iv-here")
+
+    def test_decrypt_rejects_invalid_base64(self):
+        # Bad base64 in either half used to surface as a binascii.Error
+        # bubbling out of pay_invoice. Now normalized into ValueError.
+        recipient_secret = bytes.fromhex("22" * 32)
+        sender_pubkey = _derive_xonly_pubkey(bytes.fromhex("11" * 32))
+
+        with pytest.raises(ValueError, match="invalid base64"):
+            NwcWallet._nip04_decrypt(
+                recipient_secret, sender_pubkey, "!!!not-base64!!!?iv=AAAA"
+            )
+
+    def test_decrypt_rejects_wrong_iv_length(self):
+        # AES-CBC requires a 16-byte IV; an IV that decodes to a different
+        # length should be a clear ValueError, not the underlying crypto
+        # layer's less specific error.
+        recipient_secret = bytes.fromhex("22" * 32)
+        sender_pubkey = _derive_xonly_pubkey(bytes.fromhex("11" * 32))
+
+        # "AA" decodes to 1 byte; valid base64 but wrong length for an IV.
+        with pytest.raises(ValueError, match="IV must decode to 16 bytes"):
+            NwcWallet._nip04_decrypt(
+                recipient_secret, sender_pubkey, "AAAA?iv=AA=="
+            )
 
 
 class TestVersion:

@@ -54,10 +54,18 @@ export LND_TLS_CERT_PATH="/path/to/tls.cert"  # optional
 
 ### NWC (Nostr Wallet Connect)
 
+NWC works out of the box on **every platform including Windows** — the
+required crypto (`coincurve` + `cryptography` + `websockets`) ships as a
+base dependency with prebuilt wheels, so there is no `pip install ...[nwc]`
+extra step.
+
 ```bash
-pip install l402-requests[nwc]
 export NWC_CONNECTION_STRING="nostr+walletconnect://pubkey?relay=wss://relay&secret=hex"
 ```
+
+> The legacy `[nwc]` extra is preserved as a no-op for back-compat —
+> `pip install l402-requests[nwc]` still resolves, but the base install
+> already covers it.
 
 ### OpenNode
 
