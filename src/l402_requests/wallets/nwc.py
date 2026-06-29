@@ -195,7 +195,7 @@ class NwcWallet(WalletBase):
         except ValueError as exc:
             raise ValueError(
                 "NWC connection string 'secret' is not valid hex; expected "
-                "64 lowercase hex characters (32 bytes)"
+                "64 hex characters (32 bytes; case-insensitive)"
             ) from exc
         if len(secret_bytes) != 32:
             raise ValueError(
@@ -363,6 +363,8 @@ class NwcWallet(WalletBase):
         from cryptography.hazmat.primitives import padding
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+        import binascii
+
         parts = ciphertext.split("?iv=")
         if len(parts) != 2 or not parts[0] or not parts[1]:
             raise ValueError(
@@ -370,10 +372,25 @@ class NwcWallet(WalletBase):
                 "'base64(ct)?iv=base64(iv)' format"
             )
 
-        shared_x = _compute_shared_x(secret_key, sender_pubkey_hex)
+        # Normalize base64 errors into the same ValueError contract — without
+        # this, a malformed ct or iv segment would surface as a binascii.Error
+        # bubbling out of pay_invoice, which is harder to triage.
+        try:
+            ct = base64.b64decode(parts[0], validate=True)
+            iv = base64.b64decode(parts[1], validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(
+                "NIP-04 ciphertext contains invalid base64 (in the "
+                "ciphertext or IV segment)"
+            ) from exc
+        # AES-CBC requires a 16-byte IV; catch length issues before the
+        # crypto layer raises its own (less specific) error.
+        if len(iv) != 16:
+            raise ValueError(
+                f"NIP-04 IV must decode to 16 bytes; got {len(iv)} bytes"
+            )
 
-        ct = base64.b64decode(parts[0])
-        iv = base64.b64decode(parts[1])
+        shared_x = _compute_shared_x(secret_key, sender_pubkey_hex)
 
         cipher = Cipher(algorithms.AES(shared_x), modes.CBC(iv))
         decryptor = cipher.decryptor()

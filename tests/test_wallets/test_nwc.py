@@ -345,6 +345,30 @@ class TestNip04RoundTrip:
         with pytest.raises(ValueError, match="NIP-04 ciphertext"):
             NwcWallet._nip04_decrypt(recipient_secret, sender_pubkey, "no-iv-here")
 
+    def test_decrypt_rejects_invalid_base64(self):
+        # Bad base64 in either half used to surface as a binascii.Error
+        # bubbling out of pay_invoice. Now normalized into ValueError.
+        recipient_secret = bytes.fromhex("22" * 32)
+        sender_pubkey = _derive_xonly_pubkey(bytes.fromhex("11" * 32))
+
+        with pytest.raises(ValueError, match="invalid base64"):
+            NwcWallet._nip04_decrypt(
+                recipient_secret, sender_pubkey, "!!!not-base64!!!?iv=AAAA"
+            )
+
+    def test_decrypt_rejects_wrong_iv_length(self):
+        # AES-CBC requires a 16-byte IV; an IV that decodes to a different
+        # length should be a clear ValueError, not the underlying crypto
+        # layer's less specific error.
+        recipient_secret = bytes.fromhex("22" * 32)
+        sender_pubkey = _derive_xonly_pubkey(bytes.fromhex("11" * 32))
+
+        # "AA" decodes to 1 byte; valid base64 but wrong length for an IV.
+        with pytest.raises(ValueError, match="IV must decode to 16 bytes"):
+            NwcWallet._nip04_decrypt(
+                recipient_secret, sender_pubkey, "AAAA?iv=AA=="
+            )
+
 
 class TestVersion:
     def test_version_matches_package_metadata(self):
