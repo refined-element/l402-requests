@@ -184,6 +184,25 @@ class NwcWallet(WalletBase):
         if not self._secret:
             raise ValueError("NWC connection string missing secret")
 
+        # Validate the secret up front. ``bytes.fromhex`` raises a raw, opaque
+        # ``ValueError`` from deep inside the pay_invoice path if the secret is
+        # malformed — fail with a clearer error here instead, mentioning the
+        # canonical NWC URI format. Length check catches "secret hex looks right
+        # but it's not 32 bytes", which would otherwise silently produce a wrong
+        # keypair downstream.
+        try:
+            secret_bytes = bytes.fromhex(self._secret)
+        except ValueError as exc:
+            raise ValueError(
+                "NWC connection string 'secret' is not valid hex; expected "
+                "64 lowercase hex characters (32 bytes)"
+            ) from exc
+        if len(secret_bytes) != 32:
+            raise ValueError(
+                "NWC connection string 'secret' must decode to exactly 32 "
+                f"bytes; got {len(secret_bytes)} bytes"
+            )
+
         # Some NWC URIs ship the wallet pubkey in 66-hex COMPRESSED form
         # (02/03 parity-byte prefix); NIP-01 events carry the 64-hex x-only
         # form. Normalize once at construction time so every downstream use
@@ -200,11 +219,19 @@ class NwcWallet(WalletBase):
         """Pay via NWC protocol (NIP-47 pay_invoice)."""
         try:
             import websockets  # noqa: F401  (required dep — fail loudly if missing)
-        except ImportError:
+        except ImportError as exc:
+            # ``websockets`` is a BASE dependency of l402-requests (see
+            # pyproject.toml). If we land here it indicates a broken
+            # install (partial pip operation, stale virtualenv, etc.) — not
+            # a missing optional extra. Point users at reinstalling the
+            # package rather than installing a sub-package the resolver
+            # should have already pulled in.
             raise ImportError(
-                "NWC wallet requires the 'websockets' package. "
-                "Install with: pip install websockets"
-            )
+                "NWC wallet requires the 'websockets' package, which is a "
+                "base dependency of l402-requests but is missing from your "
+                "environment. Reinstall the package: pip install --upgrade "
+                "--force-reinstall l402-requests"
+            ) from exc
 
         # Derive keypair from secret. coincurve.PrivateKey carries the raw
         # 32-byte secret_bytes through to sign/ECDH; we keep the bytes form so
@@ -307,7 +334,7 @@ class NwcWallet(WalletBase):
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
         # AES key is the raw 32-byte shared X — matches l402-ts + CoinOS wire
-        # format (see _compute_shared_x doctring on why we don't sha256 it).
+        # format (see _compute_shared_x docstring on why we don't sha256 it).
         shared_x = _compute_shared_x(secret_key, recipient_pubkey_hex)
 
         iv = os.urandom(16)
@@ -324,15 +351,27 @@ class NwcWallet(WalletBase):
 
     @staticmethod
     def _nip04_decrypt(secret_key: bytes, sender_pubkey_hex: str, ciphertext: str) -> str:
-        """NIP-04 decryption: AES-256-CBC with raw ECDH shared-X as key."""
+        """NIP-04 decryption: AES-256-CBC with raw ECDH shared-X as key.
+
+        Raises :class:`ValueError` if ``ciphertext`` is not in the canonical
+        NIP-04 format (``base64(ct)?iv=base64(iv)``). Without this guard a
+        malformed wallet response would crash ``pay_invoice`` with an
+        opaque ``IndexError`` on the split, which is harder to triage.
+        """
         import base64
 
         from cryptography.hazmat.primitives import padding
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+        parts = ciphertext.split("?iv=")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise ValueError(
+                "NIP-04 ciphertext is not in the expected "
+                "'base64(ct)?iv=base64(iv)' format"
+            )
+
         shared_x = _compute_shared_x(secret_key, sender_pubkey_hex)
 
-        parts = ciphertext.split("?iv=")
         ct = base64.b64decode(parts[0])
         iv = base64.b64decode(parts[1])
 

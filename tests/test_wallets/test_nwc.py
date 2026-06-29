@@ -8,6 +8,7 @@ import pytest
 from l402_requests.wallets.nwc import (
     NwcWallet,
     _compute_nostr_event_id,
+    _derive_xonly_pubkey,
     _normalize_xonly_pubkey,
     verify_nostr_event_signature,
 )
@@ -38,14 +39,16 @@ def _compute_event_id(event: dict) -> str:
 
 class TestNwcWallet:
     def test_parses_connection_string(self):
-        conn = "nostr+walletconnect://abc123pubkey?relay=wss://relay.example.com&secret=deadbeef1234"
+        conn = "nostr+walletconnect://abc123pubkey?relay=wss://relay.example.com&secret=deadbeef1234deadbeef1234deadbeef1234deadbeef1234deadbeef12345678"
         wallet = NwcWallet(connection_string=conn)
         assert wallet._wallet_pubkey == "abc123pubkey"
         assert wallet._relay == "wss://relay.example.com"
-        assert wallet._secret == "deadbeef1234"
+        assert wallet._secret == (
+            "deadbeef1234deadbeef1234deadbeef1234deadbeef1234deadbeef12345678"
+        )
 
     def test_missing_relay_raises(self):
-        conn = "nostr+walletconnect://abc123pubkey?secret=deadbeef1234"
+        conn = "nostr+walletconnect://abc123pubkey?secret=deadbeef1234deadbeef1234deadbeef1234deadbeef1234deadbeef12345678"
         with pytest.raises(ValueError, match="missing relay"):
             NwcWallet(connection_string=conn)
 
@@ -55,12 +58,12 @@ class TestNwcWallet:
             NwcWallet(connection_string=conn)
 
     def test_missing_pubkey_raises(self):
-        conn = "nostr+walletconnect://?relay=wss://relay.example.com&secret=deadbeef1234"
+        conn = "nostr+walletconnect://?relay=wss://relay.example.com&secret=deadbeef1234deadbeef1234deadbeef1234deadbeef1234deadbeef12345678"
         with pytest.raises(ValueError, match="missing wallet pubkey"):
             NwcWallet(connection_string=conn)
 
     def test_custom_timeout(self):
-        conn = "nostr+walletconnect://abc123pubkey?relay=wss://relay.example.com&secret=deadbeef1234"
+        conn = "nostr+walletconnect://abc123pubkey?relay=wss://relay.example.com&secret=deadbeef1234deadbeef1234deadbeef1234deadbeef1234deadbeef12345678"
         wallet = NwcWallet(connection_string=conn, timeout=60.0)
         assert wallet._timeout == 60.0
 
@@ -297,6 +300,50 @@ class TestEventIdImplementationsAgree:
         event["id"] = signed_id
         recomputed_id = _compute_nostr_event_id(event)
         assert recomputed_id == signed_id
+
+
+class TestNip04RoundTrip:
+    """Encrypt + decrypt round-trip through the same code path.
+
+    Proves the coincurve ECDH math is symmetric end-to-end and that
+    ``_nip04_encrypt`` / ``_nip04_decrypt`` agree on the raw shared-X as
+    the AES-256-CBC key. This is the canary that catches a regression in
+    the NIP-04 wire format the next time the curve library or shared-key
+    derivation is touched — the secp256k1 → coincurve swap was exactly
+    that kind of change, and the wallet wouldn't even ack a kind-23194
+    request if the two halves drifted.
+    """
+
+    def test_encrypt_then_decrypt_round_trips(self):
+        # Deterministic test keys (NOT real wallet creds).
+        sender_secret = bytes.fromhex("11" * 32)
+        recipient_secret = bytes.fromhex("22" * 32)
+        sender_pubkey = _derive_xonly_pubkey(sender_secret)
+        recipient_pubkey = _derive_xonly_pubkey(recipient_secret)
+
+        plaintext = '{"method":"pay_invoice","params":{"invoice":"lnbc..."}}'
+
+        # Sender → recipient
+        ciphertext = NwcWallet._nip04_encrypt(
+            sender_secret, recipient_pubkey, plaintext
+        )
+        assert "?iv=" in ciphertext
+
+        # Recipient decrypts using its own secret + sender's pubkey
+        decrypted = NwcWallet._nip04_decrypt(
+            recipient_secret, sender_pubkey, ciphertext
+        )
+        assert decrypted == plaintext
+
+    def test_decrypt_rejects_malformed_ciphertext(self):
+        # The decrypt path now validates the ``?iv=`` delimiter explicitly
+        # instead of letting an IndexError surface from str.split. A
+        # malformed wallet response should produce a clear ValueError.
+        recipient_secret = bytes.fromhex("22" * 32)
+        sender_pubkey = _derive_xonly_pubkey(bytes.fromhex("11" * 32))
+
+        with pytest.raises(ValueError, match="NIP-04 ciphertext"):
+            NwcWallet._nip04_decrypt(recipient_secret, sender_pubkey, "no-iv-here")
 
 
 class TestVersion:
