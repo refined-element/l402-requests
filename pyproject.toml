@@ -28,15 +28,29 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.25.0",
+    # NWC (Nostr Wallet Connect) pubkey derivation + BIP340 Schnorr + ECDH.
+    # coincurve ships prebuilt wheels for Linux, macOS, AND Windows, so NWC
+    # works out of the box on every platform with no compiler toolchain.
+    # (Replaced the old `secp256k1` C-extension, which had no Windows wheel.)
+    "coincurve>=20.0.0",
+    "websockets>=12.0",
+    # NIP-04 AES-256-CBC encryption for NWC payload exchange. The MCP server
+    # and l402-ts use the same primitive; pinning it as a base dep means the
+    # whole pipeline works without optional extras.
+    "cryptography>=42.0.0",
 ]
 
 [project.optional-dependencies]
-nwc = ["secp256k1>=0.14.0", "websockets>=12.0"]
+# Back-compat no-op: `pip install l402-requests[nwc]` still resolves. NWC
+# support is now in the base dependencies (coincurve + websockets +
+# cryptography), so this extra is empty and exists only so existing install
+# commands don't break.
+nwc = []
 lnd = ["grpcio>=1.60.0"]
 langchain = ["langchain-core>=0.3.0"]
 crewai = ["crewai>=0.80.0"]
 autogen = ["ag2>=0.6.0"]
-all = ["secp256k1>=0.14.0", "websockets>=12.0", "grpcio>=1.60.0"]
+all = ["grpcio>=1.60.0"]
 frameworks = ["langchain-core>=0.3.0", "crewai>=0.80.0", "ag2>=0.6.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23.0", "respx>=0.21.0"]
 

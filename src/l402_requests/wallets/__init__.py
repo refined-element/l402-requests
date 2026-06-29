@@ -22,6 +22,14 @@ _CONFIG_PATH = Path.home() / ".lightning-enable" / "config.json"
 class WalletBase(ABC):
     """Abstract base for Lightning wallet adapters."""
 
+    #: Whether this adapter returns the BOLT11 payment preimage from
+    #: :meth:`pay_invoice`. ``True`` for adapters whose backend reliably
+    #: surfaces the 32-byte preimage on settled outgoing payments (Strike,
+    #: LND, NWC); ``False`` for adapters that don't (OpenNode). L402 cannot
+    #: complete without a preimage, so callers can check this attribute up
+    #: front instead of trying to pay and catching :class:`PaymentFailedError`.
+    supports_preimage: bool = True
+
     @abstractmethod
     async def pay_invoice(self, bolt11: str) -> str:
         """Pay a BOLT11 invoice and return the preimage (hex).
@@ -33,7 +41,9 @@ class WalletBase(ABC):
             Payment preimage as a hex string.
 
         Raises:
-            PaymentFailedError: If the payment fails.
+            PaymentFailedError: If the payment fails. For wallets where
+                ``supports_preimage`` is ``False`` (e.g. OpenNode), this is
+                raised when the payment settles but no preimage is returned.
         """
 
     def pay_invoice_sync(self, bolt11: str) -> str:
