@@ -1,5 +1,8 @@
 # L402-Requests
 
+[![Discord](https://img.shields.io/discord/1405389254892195951?label=community&logo=discord&color=5865F2)](https://discord.gg/rX7NxHY8vx)
+
+
 Auto-paying L402 HTTP client for Python. APIs behind Lightning paywalls just work.
 
 `L402-Requests` wraps [httpx](https://www.python-httpx.org/) and automatically handles HTTP 402 responses by paying Lightning invoices and retrying with L402 credentials. It's a drop-in HTTP client where any API behind an L402 paywall "just works."
