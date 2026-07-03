@@ -17,6 +17,7 @@ class PaymentRecord:
     preimage: str
     timestamp: float = field(default_factory=time.time)
     success: bool = True
+    macaroon: str = ""
 
 
 class SpendingLog:
@@ -32,6 +33,7 @@ class SpendingLog:
         amount_sats: int,
         preimage: str,
         success: bool = True,
+        macaroon: str = "",
     ) -> PaymentRecord:
         """Record a payment attempt."""
         entry = PaymentRecord(
@@ -40,6 +42,7 @@ class SpendingLog:
             amount_sats=amount_sats,
             preimage=preimage,
             success=success,
+            macaroon=macaroon,
         )
         self._records.append(entry)
         return entry

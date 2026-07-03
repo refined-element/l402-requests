@@ -122,6 +122,8 @@ class L402Client:
                         pass
             parsed_url = urlparse(url)
             domain = parsed_url.hostname or ""
+            # MPP challenges carry no macaroon; L402 challenges do.
+            challenge_macaroon = getattr(challenge, "macaroon", "") or ""
 
             if self._budget and amount_sats is not None:
                 self._budget.check(amount_sats, domain)
@@ -138,6 +140,7 @@ class L402Client:
                         amount_sats=amount_sats,
                         preimage="",
                         success=False,
+                        macaroon=challenge_macaroon,
                     )
                 if isinstance(e, L402Error):
                     raise
@@ -153,6 +156,7 @@ class L402Client:
                     amount_sats=amount_sats,
                     preimage=preimage,
                     success=True,
+                    macaroon=challenge_macaroon,
                 )
 
             # Cache the credential and reuse its authorization_header
@@ -299,6 +303,8 @@ class AsyncL402Client:
                     pass
         parsed_url = urlparse(url)
         domain = parsed_url.hostname or ""
+        # MPP challenges carry no macaroon; L402 challenges do.
+        challenge_macaroon = getattr(challenge, "macaroon", "") or ""
 
         if self._budget and amount_sats is not None:
             self._budget.check(amount_sats, domain)
@@ -314,6 +320,7 @@ class AsyncL402Client:
                     amount_sats=amount_sats,
                     preimage="",
                     success=False,
+                    macaroon=challenge_macaroon,
                 )
             if isinstance(e, L402Error):
                 raise
@@ -328,6 +335,7 @@ class AsyncL402Client:
                 amount_sats=amount_sats,
                 preimage=preimage,
                 success=True,
+                macaroon=challenge_macaroon,
             )
 
         # Cache the credential and reuse its authorization_header
