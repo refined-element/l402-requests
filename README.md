@@ -156,18 +156,29 @@ Some servers intentionally use a two-step L402 flow where payment and claim are 
 
 For example, the [Lightning Enable Store](https://store.lightningenable.com) returns a 402 on `POST /checkout`, and after payment you claim the order at `POST /claim` with the L402 credential.
 
-In these cases, `L402-Requests` pays the invoice automatically. Use the `spending_log` to retrieve the preimage, then make the claim request:
+In these cases, `L402-Requests` pays the invoice automatically. Use the `spending_log` to retrieve the credential (macaroon + preimage), then make the claim request:
 
 ```python
 from l402_requests import L402Client, BudgetController
 
-client = L402Client(budget=BudgetController(max_sats_per_request=50000))
+# Store products cost ~48,000 sats incl. shipping — raise the hourly/daily
+# caps too, or the default 10k/hour budget rejects the purchase.
+client = L402Client(budget=BudgetController(
+    max_sats_per_request=50000, max_sats_per_hour=50000, max_sats_per_day=100000))
 checkout = client.post("https://store.lightningenable.com/api/store/checkout",
     json={"items": [{"productId": 2, "quantity": 1, "size": "L", "color": "Black"}]})
 
-# Payment was made — retrieve credentials from the spending log
+# Payment was made — retrieve the credential from the spending log
 record = client.spending_log.records[-1]
-print(f"Paid {record.amount_sats} sats, preimage: {record.preimage}")
+print(f"Paid {record.amount_sats} sats")
+
+# Claim the order with the L402 credential
+import httpx
+claim = httpx.post(
+    "https://store.lightningenable.com/api/store/claim",
+    headers={"Authorization": f"L402 {record.macaroon}:{record.preimage}"},
+    json=claim_details,  # shipping details etc. — see the store's API docs
+)
 ```
 
 See the [full documentation](https://docs.lightningenable.com/tools/l402-requests) for the complete store purchasing example.

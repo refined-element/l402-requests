@@ -239,6 +239,8 @@ class TestL402Client:
         assert record.domain == "api.example.com"
         assert record.amount_sats == 1000
         assert record.success is True
+        assert record.macaroon == "testmacaroon123"
+        assert record.preimage == wallet.preimage
 
     def test_cached_credential_reused(self):
         wallet = MockWallet()
@@ -283,6 +285,8 @@ class TestL402Client:
 
         assert len(client.spending_log.records) == 1
         assert client.spending_log.records[0].success is False
+        # Macaroon from the parsed challenge is still recorded on failure
+        assert client.spending_log.records[0].macaroon == "testmacaroon123"
 
     def test_post_method(self):
         wallet = MockWallet()
@@ -368,6 +372,7 @@ class TestAsyncL402Client:
             await client.get("https://api.example.com/data")
 
         assert client.spending_log.total_spent() == 1000
+        assert client.spending_log.records[0].macaroon == "testmacaroon123"
 
 
 # ── MPP (Machine Payments Protocol) tests ─────────────────────────────
@@ -426,6 +431,8 @@ class TestMppClient:
         assert record.domain == "api.example.com"
         assert record.amount_sats == 1000
         assert record.success is True
+        # MPP challenges carry no macaroon
+        assert record.macaroon == ""
 
     def test_mpp_payment_failure_raises(self):
         wallet = FailingWallet()
