@@ -161,7 +161,10 @@ In these cases, `L402-Requests` pays the invoice automatically. Use the `spendin
 ```python
 from l402_requests import L402Client, BudgetController
 
-client = L402Client(budget=BudgetController(max_sats_per_request=50000))
+# Store products cost ~48,000 sats incl. shipping — raise the hourly/daily
+# caps too, or the default 10k/hour budget rejects the purchase.
+client = L402Client(budget=BudgetController(
+    max_sats_per_request=50000, max_sats_per_hour=50000, max_sats_per_day=100000))
 checkout = client.post("https://store.lightningenable.com/api/store/checkout",
     json={"items": [{"productId": 2, "quantity": 1, "size": "L", "color": "Black"}]})
 
