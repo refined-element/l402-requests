@@ -480,8 +480,14 @@ def _nip44_decrypt(secret_key: bytes, sender_pubkey_hex: str, ciphertext: str) -
     decryptor = cipher.decryptor()
     decrypted = decryptor.update(ct) + decryptor.finalize()
 
-    # First 2 bytes are the big-endian plaintext length.
+    # First 2 bytes are the big-endian plaintext length. Bound-check it against
+    # the padded region before slicing (spec strictness; only reachable after the
+    # HMAC passes, so not exploitable, but mirrors the .NET port).
     plaintext_len = struct.unpack(">H", decrypted[0:2])[0]
+    if 2 + plaintext_len > len(decrypted):
+        raise ValueError(
+            "NIP-44 declared plaintext length exceeds the padded content"
+        )
     plaintext = decrypted[2 : 2 + plaintext_len]
     return plaintext.decode("utf-8")
 
@@ -666,6 +672,26 @@ class NwcWallet(WalletBase):
                     continue
 
                 response_event = msg[2]
+                if not isinstance(response_event, dict):
+                    continue
+
+                # Parity with the .NET/TS ports: gate the response kind
+                # explicitly instead of trusting the relay-side subscription
+                # filter alone (a permissive/buggy relay may forward other kinds).
+                if response_event.get("kind") != 23195:
+                    continue
+
+                # Client-side ``#e``-tag re-check: the response MUST reference
+                # THIS request's event id (NIP-47 requires it). Defense-in-depth
+                # against a relay that ignores our ``#e`` subscription filter and
+                # forwards a response to a different request. Mirrors the .NET port.
+                referenced_event_ids = [
+                    tag[1]
+                    for tag in response_event.get("tags", [])
+                    if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "e"
+                ]
+                if event["id"] not in referenced_event_ids:
+                    continue
 
                 # F-11: verify the response is genuinely from the wallet pubkey
                 # and untampered BEFORE decrypting/trusting its content. A
@@ -678,11 +704,21 @@ class NwcWallet(WalletBase):
                     continue
 
                 # Inbound scheme is auto-detected per response (``?iv=`` ⇒ NIP-04,
-                # else NIP-44 v2), independent of the outbound scheme.
-                decrypted = _decrypt_auto(
-                    secret_bytes, self._wallet_pubkey, response_event["content"]
-                )
-                result = json.loads(decrypted)
+                # else NIP-44 v2), independent of the outbound scheme. A verified
+                # wallet event can still carry malformed ciphertext or non-JSON
+                # content — never let a raw ValueError/JSONDecodeError escape
+                # pay_invoice; log and keep waiting for a well-formed response
+                # (matches the .NET/TS ports).
+                try:
+                    decrypted = _decrypt_auto(
+                        secret_bytes, self._wallet_pubkey, response_event["content"]
+                    )
+                    result = json.loads(decrypted)
+                except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                    logger.warning(
+                        "NWC response decrypt/parse failed; ignoring event: %s", exc
+                    )
+                    continue
 
                 if result.get("error"):
                     code = result["error"].get("code", "unknown")

@@ -79,8 +79,18 @@ def _nip44_encrypt_with_shared_x(plaintext: str, shared_x: bytes) -> str:
     chacha_nonce = message_keys[32:44]
     hmac_key = message_keys[44:76]
 
+    # Pad exactly like the NIP-44 spec (2-byte length prefix + plaintext +
+    # zero padding to _calc_padded_len). The previous version omitted the zero
+    # padding, so TestNIP44Decryption never exercised the real padded region.
+    # Guard the empty-string case (_calc_padded_len rejects 0) so the
+    # empty-plaintext decrypt-tolerance test still works.
     plaintext_bytes = plaintext.encode("utf-8")
-    padded_plaintext = struct.pack(">H", len(plaintext_bytes)) + plaintext_bytes
+    if len(plaintext_bytes) > 0:
+        padded_len = _calc_padded_len(len(plaintext_bytes))
+        pad = b"\x00" * (padded_len - len(plaintext_bytes))
+    else:
+        pad = b""
+    padded_plaintext = struct.pack(">H", len(plaintext_bytes)) + plaintext_bytes + pad
 
     chacha20_nonce = b"\x00\x00\x00\x00" + chacha_nonce
     cipher = Cipher(
