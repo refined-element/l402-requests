@@ -775,6 +775,56 @@ class TestUnknownAmountRefusal:
         assert exc_info.value.reason == "unparseable"
         assert wallet.paid_invoices == []
 
+    # The async mirrors below. AsyncL402Client.request() was copy-pasted from
+    # the sync one and only the sync copy was tested, so these refusals were
+    # load-bearing but unverified. The negative-MPP guard in particular could
+    # be deleted outright with all 248 tests still passing.
+
+    @pytest.mark.asyncio
+    async def test_refuses_amountless_invoice_outside_allowlist_async(self):
+        wallet = MockWallet()
+        async with AsyncL402Client(
+            wallet=wallet,
+            budget=BudgetController(allowed_domains={"trusted.example.com"}),
+            transport=MockAsyncChallengeTransport(NO_AMOUNT_L402),
+        ) as client:
+            with pytest.raises(InvoiceAmountUnknownError):
+                await client.get("https://evil.example.com/data")
+
+        assert wallet.paid_invoices == []
+
+    @pytest.mark.asyncio
+    async def test_refuses_amountless_invoice_with_budget_disabled_async(self):
+        wallet = MockWallet()
+        async with AsyncL402Client(
+            wallet=wallet,
+            budget=None,
+            transport=MockAsyncChallengeTransport(NO_AMOUNT_L402),
+        ) as client:
+            with pytest.raises(InvoiceAmountUnknownError):
+                await client.get("https://api.example.com/data")
+
+        assert wallet.paid_invoices == []
+
+    @pytest.mark.asyncio
+    async def test_refuses_negative_mpp_amount_async(self):
+        """Mirror of test_refuses_negative_mpp_amount. Both clients now price
+        challenges through _resolve_amount_sats, so this pins the async path
+        onto that shared guard rather than a private copy of it."""
+        wallet = MockWallet()
+        budget = BudgetController(max_sats_per_hour=10_000)
+        async with AsyncL402Client(
+            wallet=wallet,
+            budget=budget,
+            transport=MockAsyncChallengeTransport(NEGATIVE_MPP),
+        ) as client:
+            with pytest.raises(InvoiceAmountUnknownError):
+                await client.get("https://api.example.com/data")
+
+        assert wallet.paid_invoices == []
+        # The budget must not have gained headroom from a bogus negative spend.
+        assert budget.spent_last_hour() == 0
+
 
 class TestWalletPreimageSupport:
     """L402 can't complete without a preimage, so a wallet that can't produce

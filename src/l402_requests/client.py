@@ -12,7 +12,11 @@ import httpx
 
 from l402_requests.bolt11 import classify_missing_amount, extract_amount_sats
 from l402_requests.budget import BudgetController
-from l402_requests.challenge import MppChallenge, find_payment_challenge
+from l402_requests.challenge import (
+    L402Challenge,
+    MppChallenge,
+    find_payment_challenge,
+)
 from l402_requests.credential_cache import CredentialCache
 from l402_requests.exceptions import (
     InvoiceAmountUnknownError,
@@ -23,6 +27,77 @@ from l402_requests.exceptions import (
 )
 from l402_requests.spending_log import SpendingLog
 from l402_requests.wallets import WalletBase, auto_detect_wallet
+
+
+def _select_challenge(response: httpx.Response) -> L402Challenge | MppChallenge | None:
+    """Pick the payment challenge out of a 402's ``WWW-Authenticate`` headers.
+
+    HTTP allows multiple ``WWW-Authenticate`` headers, so every value is tried
+    rather than just the first — otherwise a valid challenge can be discarded.
+    L402 is preferred over MPP.
+
+    Shared by both clients: see ``_resolve_amount_sats`` for why.
+
+    Returns:
+        The challenge, or None if the response carries none we recognise.
+    """
+    www_auth_values = response.headers.get_list("www-authenticate")
+    if not www_auth_values:
+        return None
+
+    # Try L402 first (preferred), then MPP
+    sorted_values = sorted(
+        www_auth_values,
+        key=lambda v: 0 if v.lower().lstrip().startswith("l402") else 1,
+    )
+    for value in sorted_values:
+        candidate = find_payment_challenge({"www-authenticate": value})
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _resolve_amount_sats(challenge: L402Challenge | MppChallenge) -> int | None:
+    """Price a challenge in satoshis, or None if the amount can't be determined.
+
+    Prefers the BOLT11-encoded amount, falling back to the MPP ``amount``
+    parameter for zero-amount invoices.
+
+    Callers must NOT read None as "no limit applies": an amount we cannot
+    determine is one we cannot check against the budget or the domain
+    allowlist, so it has to be refused rather than paid.
+
+    Deliberately shared by the sync and async clients rather than copied into
+    each.  This is money logic, and the copies drift: the sync path's tests
+    passed while the async copy of this guard was unprotected, so deleting it
+    changed nothing that any test could see.  One home, one test.
+
+    Returns:
+        Amount in satoshis (0 is a valid "pay what you want" price), or None.
+    """
+    amount_sats = extract_amount_sats(challenge.invoice)
+    if amount_sats is not None:
+        return amount_sats
+
+    # MPP challenges may include an explicit amount when the invoice is
+    # zero-amount.  Use it as a fallback for budget / logging, but only when
+    # the currency is explicitly "sat" (or absent, which defaults to sats).
+    if not (isinstance(challenge, MppChallenge) and challenge.amount):
+        return None
+    if (challenge.currency or "sat").lower() != "sat":
+        return None
+    try:
+        mpp_sats = int(challenge.amount)
+    except (ValueError, TypeError):
+        return None
+
+    # Reject a negative amount: check() would wave it through, then
+    # record_payment() would SUBTRACT it from the running total and hand a
+    # hostile server extra headroom for later payments.  Zero stays valid —
+    # that's an explicit "pay what you want" price, not an unknown one.
+    if mpp_sats < 0:
+        return None
+    return mpp_sats
 
 
 def _reject_wallet_without_preimage(wallet: WalletBase) -> None:
@@ -107,50 +182,12 @@ class L402Client:
                 return response
 
             # Parse L402 or MPP challenge (prefers L402).
-            # HTTP allows multiple WWW-Authenticate headers; iterate all
-            # values so we don't accidentally discard a valid challenge.
-            www_auth_values = response.headers.get_list("www-authenticate")
-
-            challenge = None
-            if www_auth_values:
-                # Try L402 first (preferred), then MPP
-                sorted_values = sorted(
-                    www_auth_values,
-                    key=lambda v: 0
-                    if v.lower().lstrip().startswith("l402")
-                    else 1,
-                )
-                for value in sorted_values:
-                    candidate = find_payment_challenge(
-                        {"www-authenticate": value}
-                    )
-                    if candidate is not None:
-                        challenge = candidate
-                        break
-
+            challenge = _select_challenge(response)
             if challenge is None:
                 return response  # 402 but no recognized challenge — return as-is
 
             # Extract amount and check budget
-            amount_sats = extract_amount_sats(challenge.invoice)
-            # MPP challenges may include an explicit amount when the invoice
-            # is zero-amount.  Use it as a fallback for budget / logging,
-            # but only when the currency is explicitly "sat" (or absent,
-            # which defaults to sats).
-            if amount_sats is None and isinstance(challenge, MppChallenge) and challenge.amount:
-                mpp_currency = (challenge.currency or "sat").lower()
-                if mpp_currency == "sat":
-                    try:
-                        mpp_sats = int(challenge.amount)
-                    except (ValueError, TypeError):
-                        mpp_sats = None
-                    # Reject a negative amount: check() would wave it through,
-                    # then record_payment() would SUBTRACT it from the running
-                    # total and hand a hostile server extra headroom for later
-                    # payments.  Zero stays valid — that's an explicit
-                    # "pay what you want" price, not an unknown one.
-                    if mpp_sats is not None and mpp_sats >= 0:
-                        amount_sats = mpp_sats
+            amount_sats = _resolve_amount_sats(challenge)
             parsed_url = urlparse(url)
             domain = parsed_url.hostname or ""
             # MPP challenges carry no macaroon; L402 challenges do.
@@ -310,48 +347,11 @@ class AsyncL402Client:
             return response
 
         # Parse L402 or MPP challenge (prefers L402).
-        # HTTP allows multiple WWW-Authenticate headers; iterate all
-        # values so we don't accidentally discard a valid challenge.
-        www_auth_values = response.headers.get_list("www-authenticate")
-
-        challenge = None
-        if www_auth_values:
-            sorted_values = sorted(
-                www_auth_values,
-                key=lambda v: 0
-                if v.lower().lstrip().startswith("l402")
-                else 1,
-            )
-            for value in sorted_values:
-                candidate = find_payment_challenge(
-                    {"www-authenticate": value}
-                )
-                if candidate is not None:
-                    challenge = candidate
-                    break
-
+        challenge = _select_challenge(response)
         if challenge is None:
             return response
 
-        amount_sats = extract_amount_sats(challenge.invoice)
-        # MPP challenges may include an explicit amount when the invoice
-        # is zero-amount.  Use it as a fallback for budget / logging,
-        # but only when the currency is explicitly "sat" (or absent,
-        # which defaults to sats).
-        if amount_sats is None and isinstance(challenge, MppChallenge) and challenge.amount:
-            mpp_currency = (challenge.currency or "sat").lower()
-            if mpp_currency == "sat":
-                try:
-                    mpp_sats = int(challenge.amount)
-                except (ValueError, TypeError):
-                    mpp_sats = None
-                # Reject a negative amount: check() would wave it through,
-                # then record_payment() would SUBTRACT it from the running
-                # total and hand a hostile server extra headroom for later
-                # payments.  Zero stays valid — that's an explicit
-                # "pay what you want" price, not an unknown one.
-                if mpp_sats is not None and mpp_sats >= 0:
-                    amount_sats = mpp_sats
+        amount_sats = _resolve_amount_sats(challenge)
         parsed_url = urlparse(url)
         domain = parsed_url.hostname or ""
         # MPP challenges carry no macaroon; L402 challenges do.
