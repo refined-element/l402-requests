@@ -32,10 +32,12 @@ from l402_requests.exceptions import (
     BudgetExceededError,
     ChallengeParseError,
     DomainNotAllowedError,
+    InvoiceAmountUnknownError,
     InvoiceExpiredError,
     L402Error,
     NoWalletError,
     PaymentFailedError,
+    UnsupportedWalletError,
 )
 from l402_requests.spending_log import SpendingLog
 from l402_requests.wallets import (
@@ -47,7 +49,7 @@ from l402_requests.wallets import (
     auto_detect_wallet,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     # Clients
@@ -77,8 +79,10 @@ __all__ = [
     "BudgetExceededError",
     "PaymentFailedError",
     "InvoiceExpiredError",
+    "InvoiceAmountUnknownError",
     "ChallengeParseError",
     "NoWalletError",
+    "UnsupportedWalletError",
     "DomainNotAllowedError",
 ]
 

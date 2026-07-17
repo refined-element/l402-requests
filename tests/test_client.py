@@ -7,7 +7,12 @@ import httpx
 
 from l402_requests.budget import BudgetController
 from l402_requests.client import AsyncL402Client, L402Client
-from l402_requests.exceptions import BudgetExceededError, PaymentFailedError
+from l402_requests.exceptions import (
+    BudgetExceededError,
+    InvoiceAmountUnknownError,
+    PaymentFailedError,
+    UnsupportedWalletError,
+)
 from l402_requests.wallets import WalletBase
 
 
@@ -35,6 +40,43 @@ class FailingWallet(WalletBase):
 
     def pay_invoice_sync(self, bolt11: str) -> str:
         raise PaymentFailedError("mock failure", bolt11)
+
+
+class NoPreimageWallet(WalletBase):
+    """OpenNode-like adapter: settles the payment but can't surface a preimage."""
+
+    supports_preimage = False
+
+    def __init__(self):
+        self.paid_invoices: list[str] = []
+
+    async def pay_invoice(self, bolt11: str) -> str:
+        self.paid_invoices.append(bolt11)
+        raise PaymentFailedError("no preimage returned", bolt11)
+
+    def pay_invoice_sync(self, bolt11: str) -> str:
+        self.paid_invoices.append(bolt11)
+        raise PaymentFailedError("no preimage returned", bolt11)
+
+
+class LegacyDuckTypedWallet:
+    """A wallet from before ``supports_preimage`` existed — no such attribute.
+
+    Not a WalletBase subclass, so it can't inherit the default. The client must
+    still use it: only an EXPLICIT False means "can't do L402".
+    """
+
+    def __init__(self, preimage: str = "deadbeef" * 8):
+        self.preimage = preimage
+        self.paid_invoices: list[str] = []
+
+    async def pay_invoice(self, bolt11: str) -> str:
+        self.paid_invoices.append(bolt11)
+        return self.preimage
+
+    def pay_invoice_sync(self, bolt11: str) -> str:
+        self.paid_invoices.append(bolt11)
+        return self.preimage
 
 
 # ── Mock httpx transport ─────────────────────────────────────────────────
@@ -150,6 +192,53 @@ class Mock402NoChallenge(httpx.BaseTransport):
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         return httpx.Response(402, json={"error": "Payment Required"})
+
+
+class MockChallengeTransport(httpx.BaseTransport):
+    """Returns 402 with a caller-supplied WWW-Authenticate value.
+
+    Lets a test hand the client a challenge carrying an amountless, malformed,
+    or hostile invoice. Always answers 402 — the client under test is expected
+    to refuse before any retry.
+    """
+
+    def __init__(self, www_authenticate: str):
+        self.www_authenticate = www_authenticate
+        self.request_count = 0
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.request_count += 1
+        return httpx.Response(
+            402,
+            headers={"WWW-Authenticate": self.www_authenticate},
+            json={"error": "Payment Required"},
+        )
+
+
+class MockAsyncChallengeTransport(httpx.AsyncBaseTransport):
+    """Async version of MockChallengeTransport."""
+
+    def __init__(self, www_authenticate: str):
+        self.www_authenticate = www_authenticate
+        self.request_count = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.request_count += 1
+        return httpx.Response(
+            402,
+            headers={"WWW-Authenticate": self.www_authenticate},
+            json={"error": "Payment Required"},
+        )
+
+
+# Challenges whose invoice amount cannot be determined.
+NO_AMOUNT_L402 = 'L402 macaroon="testmacaroon123", invoice="lnbc1ptest"'
+UNPARSEABLE_L402 = 'L402 macaroon="testmacaroon123", invoice="not-a-bolt11"'
+# Zero-amount invoice plus a server-supplied negative MPP amount.
+NEGATIVE_MPP = (
+    'Payment realm="api.example.com", method="lightning", '
+    'invoice="lnbc1ptest", amount="-100000", currency="sat"'
+)
 
 
 # ── Tests ────────────────────────────────────────────────────────────────
@@ -565,3 +654,172 @@ class TestAsyncMppClient:
             await client.get("https://api.example.com/data")
 
         assert client.spending_log.total_spent() == 1000
+
+
+class TestUnknownAmountRefusal:
+    """An amount we can't determine is an amount we can't authorise.
+
+    ``extract_amount_sats`` returns None both for invoices that encode no
+    amount and for invoices it can't parse at all. Reading that None as "no
+    limit applies" let a server skip ``budget.check`` entirely — which is not
+    just the sats limits but the domain allowlist too — and the spend never
+    reached the log either, hiding it from every later budget check as well.
+    """
+
+    def test_refuses_invoice_with_no_amount(self):
+        wallet = MockWallet()
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockChallengeTransport(NO_AMOUNT_L402),
+        )
+
+        with pytest.raises(InvoiceAmountUnknownError) as exc_info:
+            client.get("https://api.example.com/data")
+
+        assert exc_info.value.reason == "no-amount-encoded"
+        # Refused BEFORE spending, and nothing recorded as spent.
+        assert wallet.paid_invoices == []
+        assert client.spending_log.records == []
+
+    def test_refuses_unparseable_invoice(self):
+        wallet = MockWallet()
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockChallengeTransport(UNPARSEABLE_L402),
+        )
+
+        with pytest.raises(InvoiceAmountUnknownError) as exc_info:
+            client.get("https://api.example.com/data")
+
+        assert exc_info.value.reason == "unparseable"
+        assert wallet.paid_invoices == []
+
+    def test_refuses_amountless_invoice_outside_allowlist(self):
+        """The allowlist lives inside budget.check(), so skipping the check for
+        a None amount disabled the allowlist too — an amountless invoice from
+        ANY domain got paid."""
+        wallet = MockWallet()
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(allowed_domains={"trusted.example.com"}),
+            transport=MockChallengeTransport(NO_AMOUNT_L402),
+        )
+
+        with pytest.raises(InvoiceAmountUnknownError):
+            client.get("https://evil.example.com/data")
+
+        assert wallet.paid_invoices == []
+
+    def test_refuses_amountless_invoice_with_budget_disabled(self):
+        """An unknown amount is refused on its own merits: even with budgets
+        off, the client still can't tell the caller what it is about to spend."""
+        wallet = MockWallet()
+        client = L402Client(
+            wallet=wallet,
+            budget=None,
+            transport=MockChallengeTransport(NO_AMOUNT_L402),
+        )
+
+        with pytest.raises(InvoiceAmountUnknownError):
+            client.get("https://api.example.com/data")
+
+        assert wallet.paid_invoices == []
+
+    def test_refuses_negative_mpp_amount(self):
+        """A negative MPP amount is worse than useless: budget.check() waves it
+        through, then record_payment() SUBTRACTS it from the running total,
+        handing back headroom for later real payments. Don't trust it."""
+        wallet = MockWallet()
+        budget = BudgetController(max_sats_per_hour=10_000)
+        client = L402Client(
+            wallet=wallet,
+            budget=budget,
+            transport=MockChallengeTransport(NEGATIVE_MPP),
+        )
+
+        with pytest.raises(InvoiceAmountUnknownError):
+            client.get("https://api.example.com/data")
+
+        assert wallet.paid_invoices == []
+        # The budget must not have gained headroom from a bogus negative spend.
+        assert budget.spent_last_hour() == 0
+
+    @pytest.mark.asyncio
+    async def test_refuses_invoice_with_no_amount_async(self):
+        wallet = MockWallet()
+        async with AsyncL402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockAsyncChallengeTransport(NO_AMOUNT_L402),
+        ) as client:
+            with pytest.raises(InvoiceAmountUnknownError) as exc_info:
+                await client.get("https://api.example.com/data")
+
+        assert exc_info.value.reason == "no-amount-encoded"
+        assert wallet.paid_invoices == []
+        assert client.spending_log.records == []
+
+    @pytest.mark.asyncio
+    async def test_refuses_unparseable_invoice_async(self):
+        wallet = MockWallet()
+        async with AsyncL402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockAsyncChallengeTransport(UNPARSEABLE_L402),
+        ) as client:
+            with pytest.raises(InvoiceAmountUnknownError) as exc_info:
+                await client.get("https://api.example.com/data")
+
+        assert exc_info.value.reason == "unparseable"
+        assert wallet.paid_invoices == []
+
+
+class TestWalletPreimageSupport:
+    """L402 can't complete without a preimage, so a wallet that can't produce
+    one must be rejected BEFORE paying — otherwise the invoice is settled and
+    the retry still has no Authorization header to send. Funds gone, no access.
+    """
+
+    def test_refuses_wallet_that_cannot_produce_preimage(self):
+        wallet = NoPreimageWallet()
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockL402Transport(),
+        )
+
+        with pytest.raises(UnsupportedWalletError):
+            client.get("https://api.example.com/data")
+
+        # The whole point of failing fast: no payment was attempted.
+        assert wallet.paid_invoices == []
+
+    def test_uses_wallet_without_supports_preimage_attribute(self):
+        """Back-compat: a duck-typed wallet predating the attribute keeps
+        working. Only an explicit False blocks."""
+        wallet = LegacyDuckTypedWallet()
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockL402Transport(),
+        )
+
+        response = client.get("https://api.example.com/data")
+
+        assert response.status_code == 200
+        assert wallet.paid_invoices == ["lnbc10u1ptest"]
+
+    @pytest.mark.asyncio
+    async def test_refuses_wallet_that_cannot_produce_preimage_async(self):
+        wallet = NoPreimageWallet()
+        async with AsyncL402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockAsyncL402Transport(),
+        ) as client:
+            with pytest.raises(UnsupportedWalletError):
+                await client.get("https://api.example.com/data")
+
+        assert wallet.paid_invoices == []
