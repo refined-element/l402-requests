@@ -49,7 +49,7 @@ from l402_requests.wallets import (
     auto_detect_wallet,
 )
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 __all__ = [
     # Clients
