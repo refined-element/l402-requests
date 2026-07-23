@@ -1,0 +1,45 @@
+name: CI
+
+# Gates code BEFORE it can merge to main. A push to main that changes
+# pyproject.toml auto-publishes to PyPI (publish-pypi.yml) with no other test
+# gate in front of it, so every PR must pass this first. Adding/editing this
+# file does NOT change pyproject.toml, so it never triggers a publish.
+#
+# Runs the self-contained pytest suite: no database, secrets, or network
+# required. The optional framework-integration tests (langchain / crewai /
+# autogen) self-skip when those extras aren't installed, matching the
+# `.[dev]` install the publish workflow already uses.
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - main
+  workflow_dispatch:
+
+# One in-flight run per branch/PR; newer pushes cancel stale runs.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
