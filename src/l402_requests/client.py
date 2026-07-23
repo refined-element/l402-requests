@@ -74,11 +74,18 @@ def _resolve_amount_sats(challenge: L402Challenge | MppChallenge) -> int | None:
 
     Returns:
         Amount in satoshis (strictly positive), or None when it can't be
-        positively bounded — unknown/unparseable, non-sat currency, or an MPP
-        amount <= 0.
+        positively bounded — unknown/unparseable, non-sat currency, or a BOLT11
+        or MPP amount <= 0.
     """
     amount_sats = extract_amount_sats(challenge.invoice)
-    if amount_sats is not None:
+    # Require the BOLT11 amount to be strictly positive, not merely non-None.
+    # A literal-zero invoice ("lnbc0p1...") DECODES to 0, not None — the amount
+    # field is present, it is just zero — so a bare None-check waves it through,
+    # budget.check(0) passes, and the wallet (not the server) then picks the
+    # spend: the same blank-cheque hole ledger #42 closes on the MPP branch.
+    # A non-positive decode is treated as "no BOLT11 amount" so it falls through
+    # to the MPP amount (guarded below) or, failing that, is refused by callers.
+    if amount_sats is not None and amount_sats > 0:
         return amount_sats
 
     # MPP challenges may include an explicit amount when the invoice is

@@ -245,6 +245,13 @@ ZERO_MPP = (
     'Payment realm="api.example.com", method="lightning", '
     'invoice="lnbc1ptest", amount="0", currency="sat"'
 )
+# Literal-zero BOLT11 invoices ("lnbc0p1...", "lnbc01...") — the amount field is
+# PRESENT and parses, it is just zero, so the decoder returns 0 rather than None.
+# A bare None-check lets that 0 through, budget.check(0) passes, and the wallet —
+# not the server — then picks the spend: the same blank-cheque class as ZERO_MPP
+# above, but reached on the BOLT11 branch instead of the MPP fallback.
+ZERO_AMOUNT_L402 = 'L402 macaroon="testmacaroon123", invoice="lnbc0p1ptest"'
+ZERO_AMOUNT_NO_MULTIPLIER_L402 = 'L402 macaroon="testmacaroon123", invoice="lnbc01ptest"'
 
 
 # ── Tests ────────────────────────────────────────────────────────────────
@@ -869,6 +876,72 @@ class TestUnknownAmountRefusal:
         assert wallet.paid_invoices == []
         # The budget must not have gained headroom from a bogus negative spend.
         assert budget.spent_last_hour() == 0
+
+
+class TestLiteralZeroBolt11Refusal:
+    """Ledger #42, BOLT11 branch: a literal-zero invoice ("lnbc0p1...") decodes
+    to 0, not None. The #42 fix guarded only the MPP fallback; the BOLT11 branch
+    returned its decoded value directly, so a 0 slipped past the None-check,
+    passed budget.check(0), and handed the wallet an effectively-amountless
+    (blank-cheque) invoice. The resolved amount must be strictly positive from
+    the BOLT11 source too — a non-positive decode is refused.
+    """
+
+    def test_refuses_literal_zero_amount_invoice(self):
+        wallet = MockWallet()
+        client = L402Client(
+            wallet=wallet,
+            budget=None,  # refusal is on the amount's own merits, budget or not
+            transport=MockChallengeTransport(ZERO_AMOUNT_L402),
+        )
+
+        with pytest.raises(InvoiceAmountUnknownError):
+            client.get("https://api.example.com/data")
+
+        assert wallet.paid_invoices == []
+        assert client.spending_log.records == []
+
+    def test_refuses_literal_zero_amount_no_multiplier(self):
+        wallet = MockWallet()
+        client = L402Client(
+            wallet=wallet,
+            budget=None,
+            transport=MockChallengeTransport(ZERO_AMOUNT_NO_MULTIPLIER_L402),
+        )
+
+        with pytest.raises(InvoiceAmountUnknownError):
+            client.get("https://api.example.com/data")
+
+        assert wallet.paid_invoices == []
+
+    def test_positive_amount_invoice_still_pays(self):
+        """Guard against over-rejection: a strictly positive BOLT11 amount
+        (lnbc10u = 1000 sats) is unaffected by the zero-amount refusal."""
+        wallet = MockWallet()
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockL402Transport(),  # serves lnbc10u1ptest = 1000 sats
+        )
+
+        response = client.get("https://api.example.com/data")
+
+        assert response.status_code == 200
+        assert wallet.paid_invoices == ["lnbc10u1ptest"]
+
+    @pytest.mark.asyncio
+    async def test_refuses_literal_zero_amount_invoice_async(self):
+        wallet = MockWallet()
+        async with AsyncL402Client(
+            wallet=wallet,
+            budget=None,
+            transport=MockAsyncChallengeTransport(ZERO_AMOUNT_L402),
+        ) as client:
+            with pytest.raises(InvoiceAmountUnknownError):
+                await client.get("https://api.example.com/data")
+
+        assert wallet.paid_invoices == []
+        assert client.spending_log.records == []
 
 
 class TestWalletPreimageSupport:
