@@ -13,12 +13,16 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
-# Match: ln + network + optional(amount + optional multiplier) + "1" separator
-_BOLT11_RE = re.compile(
+# Match the WHOLE human-readable part: ln + network + optional(amount +
+# multiplier). Terminated with "$" (not a trailing "1") so it only ever matches
+# a complete HRP, never a prefix that stops at an earlier "1". The HRP is
+# isolated first (see _human_readable_part); anchoring here as well means a
+# digit sitting in the bech32 data part can never be lifted out as the amount.
+_BOLT11_HRP_RE = re.compile(
     r'^ln(?P<network>[a-z]+?)'
     r'(?P<amount>\d+)?'
     r'(?P<multiplier>[munp])?'
-    r'1',
+    r'$',
     re.IGNORECASE,
 )
 
@@ -45,6 +49,26 @@ NO_AMOUNT_ENCODED = "no-amount-encoded"
 UNPARSEABLE = "unparseable"
 
 
+def _human_readable_part(bolt11: str) -> str | None:
+    """Return the BOLT11 human-readable part, or None if there is no separator.
+
+    Per BIP-173 the bech32 separator is the LAST ``"1"`` in the string: the data
+    charset excludes ``"1"``, so every earlier ``"1"`` belongs to the HRP (only
+    ever inside the amount). Everything before that final ``"1"`` is the HRP; the
+    amount must be read from there and nowhere else.
+
+    Isolating the HRP with ``rfind("1")`` — rather than letting a regex stop at
+    the FIRST ``"1"`` — is what prevents a digit in the DATA part, or a crafted
+    stray ``"1"``, from being matched as a bogus amount (ledger #74). Mirrors the
+    hardened decoder in le-agent-sdk-python's ``_decode_invoice_amount_sats``.
+    """
+    invoice = bolt11.strip().lower()
+    separator = invoice.rfind("1")
+    if separator < 0:
+        return None
+    return invoice[:separator]
+
+
 def classify_missing_amount(bolt11: str) -> str:
     """Explain why :func:`extract_amount_sats` returned None for an invoice.
 
@@ -62,10 +86,11 @@ def classify_missing_amount(bolt11: str) -> str:
     if not bolt11:
         return UNPARSEABLE
 
-    if not _BOLT11_RE.match(bolt11.strip().lower()):
+    hrp = _human_readable_part(bolt11)
+    if hrp is None or not _BOLT11_HRP_RE.match(hrp):
         return UNPARSEABLE
 
-    # The prefix read cleanly, so a missing amount group is the only way
+    # The HRP read cleanly, so a missing amount group is the only way
     # extract_amount_sats could have returned None for this invoice.
     return NO_AMOUNT_ENCODED
 
@@ -89,8 +114,11 @@ def extract_amount_sats(bolt11: str) -> int | None:
     if not bolt11:
         return None
 
-    invoice = bolt11.strip().lower()
-    match = _BOLT11_RE.match(invoice)
+    hrp = _human_readable_part(bolt11)
+    if hrp is None:
+        return None
+
+    match = _BOLT11_HRP_RE.match(hrp)
     if not match:
         return None
 
