@@ -239,6 +239,12 @@ NEGATIVE_MPP = (
     'Payment realm="api.example.com", method="lightning", '
     'invoice="lnbc1ptest", amount="-100000", currency="sat"'
 )
+# Zero-amount invoice plus a server-supplied MPP amount of 0 — a blank cheque
+# (ledger #42): with no positive bound, the wallet would pick the spend.
+ZERO_MPP = (
+    'Payment realm="api.example.com", method="lightning", '
+    'invoice="lnbc1ptest", amount="0", currency="sat"'
+)
 
 
 # ── Tests ────────────────────────────────────────────────────────────────
@@ -603,24 +609,46 @@ class TestMppCurrencyHandling:
         record = client.spending_log.records[0]
         assert record.amount_sats == 1000
 
-    def test_zero_amount_still_recorded(self):
-        """amount_sats=0 should still be recorded in spending log (not skipped by truthiness)."""
+    def test_refuses_zero_amount_mpp(self):
+        """Ledger #42: an MPP amount<=0 resolving onto an amountless invoice is
+        a blank cheque — the wallet, not the server, would pick the spend — so
+        it can't be positively bounded and must be refused.
+
+        This test was FLIPPED from test_zero_amount_still_recorded, which pinned
+        the unsafe behaviour (it asserted the 0-sat payment succeeded and got
+        recorded). It now asserts fail-closed refusal with no payment.
+        """
         wallet = MockWallet()
         transport = MockMppZeroAmountTransport()
         client = L402Client(
             wallet=wallet,
-            budget=None,  # No budget for this test
+            budget=None,  # Refusal is on the amount's own merits, budget or not
             transport=transport,
         )
 
-        response = client.get("https://api.example.com/data")
+        with pytest.raises(InvoiceAmountUnknownError) as exc_info:
+            client.get("https://api.example.com/data")
 
-        assert response.status_code == 200
-        # Zero amount should still produce a spending log entry
-        assert len(client.spending_log.records) == 1
-        record = client.spending_log.records[0]
-        assert record.amount_sats == 0
-        assert record.success is True
+        assert exc_info.value.reason == "no-amount-encoded"
+        # Refused BEFORE spending, and nothing recorded as spent.
+        assert wallet.paid_invoices == []
+        assert client.spending_log.records == []
+
+    def test_positive_mpp_amount_on_amountless_invoice_is_paid(self):
+        """The #42 refusal is scoped to amount<=0. A strictly POSITIVE MPP
+        amount on an amountless invoice still resolves and pays — this guards
+        against the fail-closed fix over-rejecting legitimate MPP prices."""
+        wallet = MockWallet()
+        transport = MockChallengeTransport(
+            'Payment realm="api.example.com", method="lightning", '
+            'invoice="lnbc1ptest", amount="500", currency="sat"'
+        )
+        client = L402Client(wallet=wallet, budget=None, transport=transport)
+
+        client.get("https://api.example.com/data")
+
+        assert wallet.paid_invoices == ["lnbc1ptest"]
+        assert client.spending_log.total_spent() == 500
 
 
 class TestAsyncMppClient:
@@ -805,6 +833,23 @@ class TestUnknownAmountRefusal:
                 await client.get("https://api.example.com/data")
 
         assert wallet.paid_invoices == []
+
+    @pytest.mark.asyncio
+    async def test_refuses_zero_mpp_amount_async(self):
+        """Ledger #42, async mirror of test_refuses_zero_amount_mpp. Both
+        clients price through the shared _resolve_amount_sats, so this pins the
+        async path onto the same non-positive-amount guard."""
+        wallet = MockWallet()
+        async with AsyncL402Client(
+            wallet=wallet,
+            budget=None,
+            transport=MockAsyncChallengeTransport(ZERO_MPP),
+        ) as client:
+            with pytest.raises(InvoiceAmountUnknownError):
+                await client.get("https://api.example.com/data")
+
+        assert wallet.paid_invoices == []
+        assert client.spending_log.records == []
 
     @pytest.mark.asyncio
     async def test_refuses_negative_mpp_amount_async(self):

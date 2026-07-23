@@ -60,8 +60,8 @@ def _select_challenge(response: httpx.Response) -> L402Challenge | MppChallenge 
 def _resolve_amount_sats(challenge: L402Challenge | MppChallenge) -> int | None:
     """Price a challenge in satoshis, or None if the amount can't be determined.
 
-    Prefers the BOLT11-encoded amount, falling back to the MPP ``amount``
-    parameter for zero-amount invoices.
+    Prefers the BOLT11-encoded amount, falling back to a strictly positive MPP
+    ``amount`` parameter for amountless invoices.
 
     Callers must NOT read None as "no limit applies": an amount we cannot
     determine is one we cannot check against the budget or the domain
@@ -73,7 +73,9 @@ def _resolve_amount_sats(challenge: L402Challenge | MppChallenge) -> int | None:
     changed nothing that any test could see.  One home, one test.
 
     Returns:
-        Amount in satoshis (0 is a valid "pay what you want" price), or None.
+        Amount in satoshis (strictly positive), or None when it can't be
+        positively bounded — unknown/unparseable, non-sat currency, or an MPP
+        amount <= 0.
     """
     amount_sats = extract_amount_sats(challenge.invoice)
     if amount_sats is not None:
@@ -91,11 +93,15 @@ def _resolve_amount_sats(challenge: L402Challenge | MppChallenge) -> int | None:
     except (ValueError, TypeError):
         return None
 
-    # Reject a negative amount: check() would wave it through, then
-    # record_payment() would SUBTRACT it from the running total and hand a
-    # hostile server extra headroom for later payments.  Zero stays valid —
-    # that's an explicit "pay what you want" price, not an unknown one.
-    if mpp_sats < 0:
+    # Reject any non-positive amount (ledger #42).  A negative amount is worse
+    # than useless: check() would wave it through, then record_payment() would
+    # SUBTRACT it from the running total and hand a hostile server extra
+    # headroom for later payments.  Zero is a blank cheque: an amountless
+    # invoice priced at 0 lets the WALLET, not the server, pick the spend, so
+    # it can't be positively bounded any more than an unknown amount can.  Only
+    # a strictly positive amount is one we can authorise; matches the .NET
+    # port's `sats > 0` rule.
+    if mpp_sats <= 0:
         return None
     return mpp_sats
 
