@@ -218,15 +218,27 @@ class L402Client:
                     challenge.invoice,
                 )
 
-            if self._budget:
-                self._budget.check(amount_sats, domain)
-
-            # Pay the invoice
+            # Reject an unusable wallet before touching the budget ledger, so a
+            # wallet that can't do L402 never leaves a dangling reservation.
             wallet = self._get_wallet()
             _reject_wallet_without_preimage(wallet)
+
+            # Reserve BEFORE paying: reserve() atomically checks the limits
+            # (including other in-flight reservations) and books the spend, so a
+            # second concurrent payment over the cap is refused here instead of
+            # slipping past a check() that hasn't seen the first payment yet.
+            reservation_id = None
+            if self._budget:
+                reservation_id = self._budget.reserve(amount_sats, domain)
+
+            # Pay the invoice
             try:
                 preimage = wallet.pay_invoice_sync(challenge.invoice)
             except Exception as e:
+                # Payment never settled — release the reservation so the sats
+                # go back to the budget rather than being stranded as reserved.
+                if self._budget and reservation_id is not None:
+                    self._budget.release(reservation_id)
                 self.spending_log.record(
                     domain=domain,
                     path=parsed_url.path,
@@ -238,12 +250,21 @@ class L402Client:
                 if isinstance(e, L402Error):
                     raise
                 raise PaymentFailedError(str(e), challenge.invoice) from e
+            except BaseException:
+                # KeyboardInterrupt / SystemExit are BaseException, not Exception, so they
+                # skip the release above and would strand the reservation. Release it, then
+                # propagate untouched. (Kept symmetric with the async path.)
+                if self._budget and reservation_id is not None:
+                    self._budget.release(reservation_id)
+                raise
 
-            # Record successful payment.  amount_sats is always known here —
-            # unknown amounts were refused above — so every payment the client
-            # makes lands in the budget and the log, with no silent gaps.
-            if self._budget:
-                self._budget.record_payment(amount_sats)
+            # Commit the reservation now that the payment settled.  amount_sats
+            # is always known here — unknown amounts were refused above — so
+            # every payment the client makes lands in the budget and the log.
+            # The wallet adapters don't surface a routing fee, so we commit the
+            # invoice principal; a fee-aware wallet would commit principal + fee.
+            if self._budget and reservation_id is not None:
+                self._budget.commit(reservation_id, amount_sats)
             self.spending_log.record(
                 domain=domain,
                 path=parsed_url.path,
@@ -382,14 +403,26 @@ class AsyncL402Client:
                 challenge.invoice,
             )
 
-        if self._budget:
-            self._budget.check(amount_sats, domain)
-
+        # Reject an unusable wallet before touching the budget ledger, so a
+        # wallet that can't do L402 never leaves a dangling reservation.
         wallet = self._get_wallet()
         _reject_wallet_without_preimage(wallet)
+
+        # Reserve BEFORE the await: reserve() runs to completion without
+        # yielding, so it atomically checks the limits (including other
+        # in-flight reservations) and books the spend. A second coroutine that
+        # resumes while this one awaits the wallet is refused here instead of
+        # slipping past a check() that hasn't seen this payment yet.
+        reservation_id = None
+        if self._budget:
+            reservation_id = self._budget.reserve(amount_sats, domain)
+
         try:
             preimage = await wallet.pay_invoice(challenge.invoice)
         except Exception as e:
+            # Payment never settled — release the reservation.
+            if self._budget and reservation_id is not None:
+                self._budget.release(reservation_id)
             self.spending_log.record(
                 domain=domain,
                 path=parsed_url.path,
@@ -401,11 +434,22 @@ class AsyncL402Client:
             if isinstance(e, L402Error):
                 raise
             raise PaymentFailedError(str(e), challenge.invoice) from e
+        except BaseException:
+            # asyncio.CancelledError (the normal outcome of an asyncio.wait_for timeout or
+            # client shutdown), KeyboardInterrupt and SystemExit are BaseException, NOT
+            # Exception — so they skip the release above and would strand the reservation
+            # permanently (progressive budget starvation, since there is no TTL). Release
+            # it, then propagate the cancellation untouched.
+            if self._budget and reservation_id is not None:
+                self._budget.release(reservation_id)
+            raise
 
         # amount_sats is always known here — unknown amounts were refused
-        # above — so every payment lands in the budget and the log.
-        if self._budget:
-            self._budget.record_payment(amount_sats)
+        # above — so every payment lands in the budget and the log. Wallet
+        # adapters don't surface a routing fee, so we commit the invoice
+        # principal; a fee-aware wallet would commit principal + fee.
+        if self._budget and reservation_id is not None:
+            self._budget.commit(reservation_id, amount_sats)
         self.spending_log.record(
             domain=domain,
             path=parsed_url.path,

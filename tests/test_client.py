@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import threading
+import time
+
 import pytest
 import httpx
 
@@ -942,6 +947,152 @@ class TestLiteralZeroBolt11Refusal:
 
         assert wallet.paid_invoices == []
         assert client.spending_log.records == []
+
+
+class GatedSyncWallet(WalletBase):
+    """Wallet that blocks inside the payment until the test opens the gate.
+
+    Lets the test hold one or more payments 'in flight' simultaneously so the
+    check-then-pay-then-record race can be provoked deterministically: with the
+    old code both concurrent requests pass ``check()`` and both settle; with the
+    reserve/commit fix the second request is refused at ``reserve()`` and never
+    reaches the wallet.
+    """
+
+    def __init__(self, preimage: str = "ab" * 32):
+        self.preimage = preimage
+        self.pay_calls = 0
+        self._lock = threading.Lock()
+        self.entered = threading.Event()  # set once a payment is in-flight
+        self.gate = threading.Event()  # test opens this to let payments finish
+
+    def pay_invoice_sync(self, bolt11: str) -> str:
+        with self._lock:
+            self.pay_calls += 1
+        self.entered.set()
+        # Block so concurrent payments overlap; bounded so a bug can't hang CI.
+        self.gate.wait(timeout=5)
+        return self.preimage
+
+    async def pay_invoice(self, bolt11: str) -> str:  # pragma: no cover - unused
+        return self.pay_invoice_sync(bolt11)
+
+
+class GatedAsyncWallet(WalletBase):
+    """Async analogue of GatedSyncWallet using asyncio primitives."""
+
+    def __init__(self, preimage: str = "ab" * 32):
+        self.preimage = preimage
+        self.pay_calls = 0
+        self.entered = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def pay_invoice(self, bolt11: str) -> str:
+        self.pay_calls += 1
+        self.entered.set()
+        await self.gate.wait()
+        return self.preimage
+
+    def pay_invoice_sync(self, bolt11: str) -> str:  # pragma: no cover - unused
+        raise NotImplementedError
+
+
+class TestConcurrentPaymentBudget:
+    """Two concurrent payments whose sum exceeds the cap: exactly one must win
+    and the window total must never exceed the cap. This is the funds-safety
+    TOCTOU: ``check()`` and ``record_payment()`` are separate, so a second
+    request slips through against the still-unrecorded total.
+    """
+
+    def test_sync_concurrent_payments_never_exceed_cap(self):
+        # Each invoice is 1000 sats (lnbc10u); cap is 1500 => only one fits.
+        budget = BudgetController(
+            max_sats_per_request=1000,
+            max_sats_per_hour=1500,
+            max_sats_per_day=1500,
+        )
+        wallet = GatedSyncWallet()
+        transport = MockL402Transport()
+        client = L402Client(wallet=wallet, budget=budget, transport=transport)
+        url = "https://api.example.com/data"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            futures = [ex.submit(client.get, url) for _ in range(2)]
+
+            # Wait for one payment to be in-flight, then let the other resolve
+            # (enter the wallet under the buggy code, or be refused under the
+            # fix) before opening the gate.
+            assert wallet.entered.wait(timeout=5)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                done = sum(1 for f in futures if f.done())
+                if wallet.pay_calls >= 2 or done >= 1:
+                    break
+                time.sleep(0.01)
+            wallet.gate.set()
+
+            results = []
+            for f in futures:
+                try:
+                    results.append(("ok", f.result(timeout=5)))
+                except Exception as e:  # noqa: BLE001
+                    results.append(("err", e))
+
+        successes = [r for _, r in results if _ == "ok"]
+        errors = [e for tag, e in results if tag == "err"]
+
+        assert len(successes) == 1, f"expected exactly one success, got {results}"
+        assert len(errors) == 1
+        assert isinstance(errors[0], BudgetExceededError)
+        # Only one payment actually settled.
+        assert wallet.pay_calls == 1
+        # The window total never exceeded the cap.
+        assert budget.spent_last_hour() == 1000
+        assert budget.spent_last_hour() <= 1500
+
+    @pytest.mark.asyncio
+    async def test_async_concurrent_payments_never_exceed_cap(self):
+        budget = BudgetController(
+            max_sats_per_request=1000,
+            max_sats_per_hour=1500,
+            max_sats_per_day=1500,
+        )
+        wallet = GatedAsyncWallet()
+        transport = MockAsyncL402Transport()
+        url = "https://api.example.com/data"
+
+        async with AsyncL402Client(
+            wallet=wallet, budget=budget, transport=transport
+        ) as client:
+
+            async def one():
+                try:
+                    return ("ok", await client.get(url))
+                except Exception as e:  # noqa: BLE001
+                    return ("err", e)
+
+            task_a = asyncio.create_task(one())
+            task_b = asyncio.create_task(one())
+
+            # One payment reaches the wallet; let the other resolve, then open.
+            await asyncio.wait_for(wallet.entered.wait(), timeout=5)
+            for _ in range(1000):
+                if wallet.pay_calls >= 2 or task_a.done() or task_b.done():
+                    break
+                await asyncio.sleep(0)
+            wallet.gate.set()
+
+            results = await asyncio.gather(task_a, task_b)
+
+        successes = [r for tag, r in results if tag == "ok"]
+        errors = [r for tag, r in results if tag == "err"]
+
+        assert len(successes) == 1, f"expected exactly one success, got {results}"
+        assert len(errors) == 1
+        assert isinstance(errors[0], BudgetExceededError)
+        assert wallet.pay_calls == 1
+        assert budget.spent_last_hour() == 1000
+        assert budget.spent_last_hour() <= 1500
 
 
 class TestWalletPreimageSupport:
