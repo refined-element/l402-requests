@@ -155,8 +155,12 @@ class BudgetController:
         total is always consistent. Unknown ids are ignored (idempotent).
         """
         with self._lock:
-            self._reservations.pop(reservation_id, None)
-            self._payments.append((time.time(), actual_amount_sats))
+            # Idempotent: only record spend if the reservation was still live. A
+            # double-commit, or a commit of an already-released/unknown id, must NOT
+            # append a phantom payment that would over-count the window and starve the
+            # budget. Matches release()'s idempotency.
+            if self._reservations.pop(reservation_id, None) is not None:
+                self._payments.append((time.time(), actual_amount_sats))
 
     def release(self, reservation_id: int) -> None:
         """Drop a reservation without recording any spend (payment failed/refused).

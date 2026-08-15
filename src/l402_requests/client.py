@@ -250,6 +250,13 @@ class L402Client:
                 if isinstance(e, L402Error):
                     raise
                 raise PaymentFailedError(str(e), challenge.invoice) from e
+            except BaseException:
+                # KeyboardInterrupt / SystemExit are BaseException, not Exception, so they
+                # skip the release above and would strand the reservation. Release it, then
+                # propagate untouched. (Kept symmetric with the async path.)
+                if self._budget and reservation_id is not None:
+                    self._budget.release(reservation_id)
+                raise
 
             # Commit the reservation now that the payment settled.  amount_sats
             # is always known here — unknown amounts were refused above — so
@@ -427,6 +434,15 @@ class AsyncL402Client:
             if isinstance(e, L402Error):
                 raise
             raise PaymentFailedError(str(e), challenge.invoice) from e
+        except BaseException:
+            # asyncio.CancelledError (the normal outcome of an asyncio.wait_for timeout or
+            # client shutdown), KeyboardInterrupt and SystemExit are BaseException, NOT
+            # Exception — so they skip the release above and would strand the reservation
+            # permanently (progressive budget starvation, since there is no TTL). Release
+            # it, then propagate the cancellation untouched.
+            if self._budget and reservation_id is not None:
+                self._budget.release(reservation_id)
+            raise
 
         # amount_sats is always known here — unknown amounts were refused
         # above — so every payment lands in the budget and the log. Wallet

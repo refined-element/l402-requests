@@ -147,6 +147,16 @@ class TestBudgetReservation:
         budget.commit(rid, 1050)  # principal 1000 + 50 fee
         assert budget.spent_last_hour() == 1050
 
+    def test_commit_is_idempotent(self):
+        # A double-commit, or a commit of an already-released/unknown id, must NOT record
+        # a phantom payment (over-counting the window). Matches release()'s idempotency.
+        budget = BudgetController(max_sats_per_request=1000, max_sats_per_hour=10_000)
+        rid = budget.reserve(1000)
+        budget.commit(rid, 1000)
+        budget.commit(rid, 1000)      # same id again — reservation already resolved
+        budget.commit(999_999, 1000)  # never-reserved id
+        assert budget.spent_last_hour() == 1000
+
     def test_release_frees_reservation_without_spending(self):
         budget = BudgetController(max_sats_per_request=1000, max_sats_per_hour=1500)
         rid = budget.reserve(1000)
