@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
+import json
 import threading
 import time
 
@@ -14,10 +16,12 @@ from l402_requests.budget import BudgetController
 from l402_requests.client import AsyncL402Client, L402Client
 from l402_requests.exceptions import (
     BudgetExceededError,
+    ChallengeExpiredError,
     InvoiceAmountUnknownError,
     PaymentFailedError,
     UnsupportedWalletError,
 )
+from l402_requests.receipt import PaymentReceipt
 from l402_requests.wallets import WalletBase
 
 
@@ -1142,3 +1146,454 @@ class TestWalletPreimageSupport:
                 await client.get("https://api.example.com/data")
 
         assert wallet.paid_invoices == []
+
+
+# ── MPP draft-00 (modern Payment) client tests ───────────────────────────
+
+FIXTURE_PAYMENT_HASH = "ab" * 32
+FIXTURE_PREIMAGE = "deadbeef" * 8
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+# lnbc10u = 1000 sats
+MODERN_REQUEST_PARAM = _b64url(
+    json.dumps(
+        {
+            "amount": "1000",
+            "currency": "sat",
+            "methodDetails": {
+                "invoice": "lnbc10u1ptest",
+                "paymentHash": FIXTURE_PAYMENT_HASH,
+                "network": "mainnet",
+            },
+        }
+    ).encode()
+)
+
+MODERN_CHALLENGE = (
+    'Payment id="fixture-challenge-id", realm="api.example.com", '
+    'method="lightning", intent="charge", '
+    f'request="{MODERN_REQUEST_PARAM}", expires="2099-01-01T00:00:00Z"'
+)
+
+EXPIRED_MODERN_CHALLENGE = (
+    'Payment id="fixture-challenge-id", realm="api.example.com", '
+    'method="lightning", intent="charge", '
+    f'request="{MODERN_REQUEST_PARAM}", expires="2001-01-01T00:00:00Z"'
+)
+
+# Superset: same header also carries legacy invoice/amount/currency params
+# (with a DIFFERENT legacy invoice, to prove which one gets paid).
+SUPERSET_CHALLENGE = (
+    MODERN_CHALLENGE + ', invoice="lnbc20u1plegacy", amount="2000", currency="sat"'
+)
+
+LEGACY_CHALLENGE = (
+    'Payment realm="api.example.com", method="lightning", '
+    'invoice="lnbc20u1plegacy", amount="2000", currency="sat"'
+)
+
+RECEIPT_VALUE = _b64url(
+    json.dumps(
+        {
+            "challengeId": "fixture-challenge-id",
+            "method": "lightning",
+            "reference": FIXTURE_PAYMENT_HASH,
+            "status": "settled",
+            "timestamp": "2026-08-23T00:00:00Z",
+        }
+    ).encode()
+)
+
+
+def _decode_modern_credential(auth: str) -> dict | None:
+    """Decode an ``Authorization: Payment <b64url token>`` value, or None."""
+    if not auth.startswith("Payment "):
+        return None
+    token = auth[len("Payment "):].strip()
+    # Legacy MPP credentials look like: Payment method="lightning", preimage="..."
+    if "=" in token or '"' in token or "," in token:
+        return None
+    try:
+        return json.loads(_b64url_decode(token))
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+
+def _modern_credential_is_valid(cred: dict | None) -> bool:
+    return (
+        cred is not None
+        and cred.get("challenge", {}).get("request") == MODERN_REQUEST_PARAM
+        and cred.get("payload", {}).get("preimage") == FIXTURE_PREIMAGE
+    )
+
+
+class MockDraft00Transport(httpx.BaseTransport):
+    """Simulates a draft-00 MPP server: verifies the modern credential's
+    challenge echo + preimage, answers 200 with a Payment-Receipt header."""
+
+    def __init__(
+        self,
+        www_authenticate=MODERN_CHALLENGE,
+        receipt_value: str | None = RECEIPT_VALUE,
+        multi_headers: list[str] | None = None,
+    ):
+        self.request_count = 0
+        self.www_authenticate = www_authenticate
+        self.receipt_value = receipt_value
+        self.multi_headers = multi_headers
+        self.seen_credentials: list[dict] = []
+        self.seen_auth_headers: list[str] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.request_count += 1
+        auth = request.headers.get("authorization", "")
+        if auth:
+            self.seen_auth_headers.append(auth)
+
+        cred = _decode_modern_credential(auth)
+        if cred is not None:
+            self.seen_credentials.append(cred)
+        if _modern_credential_is_valid(cred):
+            headers = {}
+            if self.receipt_value is not None:
+                headers["Payment-Receipt"] = self.receipt_value
+            return httpx.Response(
+                200, headers=headers, json={"data": "draft00 paid content"}
+            )
+
+        if self.multi_headers is not None:
+            headers = [("WWW-Authenticate", v) for v in self.multi_headers]
+        else:
+            headers = {"WWW-Authenticate": self.www_authenticate}
+        return httpx.Response(402, headers=headers, json={"error": "Payment Required"})
+
+
+class MockAsyncDraft00Transport(httpx.AsyncBaseTransport):
+    """Async version of MockDraft00Transport."""
+
+    def __init__(
+        self,
+        www_authenticate=MODERN_CHALLENGE,
+        receipt_value: str | None = RECEIPT_VALUE,
+    ):
+        self._sync = MockDraft00Transport(
+            www_authenticate=www_authenticate, receipt_value=receipt_value
+        )
+
+    @property
+    def request_count(self) -> int:
+        return self._sync.request_count
+
+    @property
+    def seen_credentials(self) -> list[dict]:
+        return self._sync.seen_credentials
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return self._sync.handle_request(request)
+
+
+class TestDraft00Client:
+    def test_auto_pays_draft00_402_and_retries(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        transport = MockDraft00Transport()
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=transport,
+        )
+
+        response = client.get("https://api.example.com/data")
+
+        assert response.status_code == 200
+        assert response.json() == {"data": "draft00 paid content"}
+        # The invoice paid is the one inside the decoded request param.
+        assert wallet.paid_invoices == ["lnbc10u1ptest"]
+        assert transport.request_count == 2
+
+    def test_draft00_credential_echoes_challenge(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        transport = MockDraft00Transport()
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=transport,
+        )
+
+        client.get("https://api.example.com/data")
+
+        assert len(transport.seen_credentials) == 1
+        cred = transport.seen_credentials[0]
+        echoed = cred["challenge"]
+        assert echoed["id"] == "fixture-challenge-id"
+        assert echoed["realm"] == "api.example.com"
+        assert echoed["method"] == "lightning"
+        assert echoed["intent"] == "charge"
+        assert echoed["request"] == MODERN_REQUEST_PARAM
+        assert echoed["expires"] == "2099-01-01T00:00:00Z"
+        assert cred["payload"] == {"preimage": FIXTURE_PREIMAGE}
+
+    def test_draft00_receipt_exposed_on_response(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockDraft00Transport(),
+        )
+
+        response = client.get("https://api.example.com/data")
+
+        receipt = response.payment_receipt
+        assert isinstance(receipt, PaymentReceipt)
+        assert receipt.challenge_id == "fixture-challenge-id"
+        assert receipt.reference == FIXTURE_PAYMENT_HASH
+        assert receipt.status == "settled"
+
+    def test_draft00_absent_receipt_is_none(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockDraft00Transport(receipt_value=None),
+        )
+
+        response = client.get("https://api.example.com/data")
+
+        assert response.status_code == 200
+        assert response.payment_receipt is None
+
+    def test_draft00_malformed_receipt_tolerated(self):
+        """A malformed receipt must not fail the successful payment."""
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockDraft00Transport(receipt_value="!!!not-base64url!!!"),
+        )
+
+        response = client.get("https://api.example.com/data")
+
+        assert response.status_code == 200
+        assert response.payment_receipt is None
+
+    def test_draft00_credential_single_use_not_cached(self):
+        """Modern credentials are single-use server-side: a second request
+        must NOT be served from the credential cache — it pays again."""
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        transport = MockDraft00Transport()
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=transport,
+        )
+
+        first = client.get("https://api.example.com/data")
+        second = client.get("https://api.example.com/data")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        # Two payments, two full 402→pay→retry cycles.
+        assert len(wallet.paid_invoices) == 2
+        assert transport.request_count == 4
+
+    def test_draft00_expired_challenge_refused(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        transport = MockDraft00Transport(www_authenticate=EXPIRED_MODERN_CHALLENGE)
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=transport,
+        )
+
+        with pytest.raises(ChallengeExpiredError):
+            client.get("https://api.example.com/data")
+
+        # Refused BEFORE paying; no retry, nothing spent or logged.
+        assert wallet.paid_invoices == []
+        assert client.spending_log.records == []
+        assert transport.request_count == 1
+
+    def test_draft00_preferred_over_legacy_separate_headers(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        transport = MockDraft00Transport(
+            multi_headers=[LEGACY_CHALLENGE, MODERN_CHALLENGE]
+        )
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=transport,
+        )
+
+        response = client.get("https://api.example.com/data")
+
+        assert response.status_code == 200
+        # The modern challenge's invoice was paid, not the legacy one.
+        assert wallet.paid_invoices == ["lnbc10u1ptest"]
+        assert len(transport.seen_credentials) == 1
+
+    def test_draft00_superset_header_uses_modern_credential(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        transport = MockDraft00Transport(www_authenticate=SUPERSET_CHALLENGE)
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=transport,
+        )
+
+        response = client.get("https://api.example.com/data")
+
+        assert response.status_code == 200
+        assert wallet.paid_invoices == ["lnbc10u1ptest"]
+        assert len(transport.seen_credentials) == 1
+        # Legacy extras never leak into the credential echo.
+        assert "invoice" not in transport.seen_credentials[0]["challenge"]
+
+    def test_l402_still_preferred_over_draft00(self):
+        """Existing L402-vs-Payment preference is unchanged: with both
+        challenges offered, the L402 one is used."""
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+
+        class L402AndModernTransport(httpx.BaseTransport):
+            def __init__(self):
+                self.request_count = 0
+                self.seen_auth_headers: list[str] = []
+
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                self.request_count += 1
+                auth = request.headers.get("authorization", "")
+                if auth:
+                    self.seen_auth_headers.append(auth)
+                if auth.startswith("L402 "):
+                    return httpx.Response(200, json={"data": "paid content"})
+                return httpx.Response(
+                    402,
+                    headers=[
+                        ("WWW-Authenticate", 'L402 macaroon="testmacaroon123", invoice="lnbc10u1ptest"'),
+                        ("WWW-Authenticate", MODERN_CHALLENGE),
+                    ],
+                    json={"error": "Payment Required"},
+                )
+
+        transport = L402AndModernTransport()
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=transport,
+        )
+
+        response = client.get("https://api.example.com/data")
+
+        assert response.status_code == 200
+        assert transport.seen_auth_headers[-1].startswith("L402 ")
+
+    def test_draft00_budget_enforced(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=500),  # invoice is 1000
+            transport=MockDraft00Transport(),
+        )
+
+        with pytest.raises(BudgetExceededError):
+            client.get("https://api.example.com/data")
+
+        assert wallet.paid_invoices == []
+
+    def test_draft00_spending_log_records_payment(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        client = L402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockDraft00Transport(),
+        )
+
+        client.get("https://api.example.com/data")
+
+        assert client.spending_log.total_spent() == 1000
+        record = client.spending_log.records[0]
+        assert record.domain == "api.example.com"
+        assert record.amount_sats == 1000
+        assert record.success is True
+        # Modern Payment challenges carry no macaroon.
+        assert record.macaroon == ""
+
+
+class TestAsyncDraft00Client:
+    @pytest.mark.asyncio
+    async def test_auto_pays_draft00_402_and_retries_async(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        transport = MockAsyncDraft00Transport()
+
+        async with AsyncL402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=transport,
+        ) as client:
+            response = await client.get("https://api.example.com/data")
+
+        assert response.status_code == 200
+        assert response.json() == {"data": "draft00 paid content"}
+        assert wallet.paid_invoices == ["lnbc10u1ptest"]
+        assert len(transport.seen_credentials) == 1
+        assert (
+            transport.seen_credentials[0]["challenge"]["request"]
+            == MODERN_REQUEST_PARAM
+        )
+
+    @pytest.mark.asyncio
+    async def test_draft00_receipt_exposed_async(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+
+        async with AsyncL402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=MockAsyncDraft00Transport(),
+        ) as client:
+            response = await client.get("https://api.example.com/data")
+
+        receipt = response.payment_receipt
+        assert isinstance(receipt, PaymentReceipt)
+        assert receipt.reference == FIXTURE_PAYMENT_HASH
+
+    @pytest.mark.asyncio
+    async def test_draft00_expired_challenge_refused_async(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        transport = MockAsyncDraft00Transport(
+            www_authenticate=EXPIRED_MODERN_CHALLENGE
+        )
+
+        async with AsyncL402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=2000),
+            transport=transport,
+        ) as client:
+            with pytest.raises(ChallengeExpiredError):
+                await client.get("https://api.example.com/data")
+
+        assert wallet.paid_invoices == []
+        assert client.spending_log.records == []
+
+    @pytest.mark.asyncio
+    async def test_draft00_credential_single_use_not_cached_async(self):
+        wallet = MockWallet(preimage=FIXTURE_PREIMAGE)
+        transport = MockAsyncDraft00Transport()
+
+        async with AsyncL402Client(
+            wallet=wallet,
+            budget=BudgetController(max_sats_per_request=5000),
+            transport=transport,
+        ) as client:
+            first = await client.get("https://api.example.com/data")
+            second = await client.get("https://api.example.com/data")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert len(wallet.paid_invoices) == 2
+        assert transport.request_count == 4

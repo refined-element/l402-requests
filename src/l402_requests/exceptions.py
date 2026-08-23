@@ -45,6 +45,28 @@ class ChallengeParseError(L402Error):
         super().__init__(f"Failed to parse challenge: {reason}")
 
 
+class ChallengeExpiredError(L402Error):
+    """A modern (draft-00) Payment challenge has already expired.
+
+    Raised *before* the payment is attempted: an expired challenge can no
+    longer settle server-side, so paying its invoice would spend funds for no
+    access. Request the resource again to get a fresh challenge. Like
+    :class:`UnsupportedWalletError` this is a precondition failure rather than
+    a payment failure — code catching :class:`PaymentFailedError` should not
+    expect it. No funds are spent.
+
+    Attributes:
+        expires: The challenge's RFC 3339 ``expires`` value, when available.
+    """
+
+    def __init__(self, expires: str | None = None):
+        self.expires = expires
+        super().__init__(
+            "Payment challenge has expired; request the resource again "
+            "for a fresh challenge"
+        )
+
+
 class NoWalletError(L402Error):
     """No wallet configured or auto-detected."""
 
