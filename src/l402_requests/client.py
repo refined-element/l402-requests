@@ -15,16 +15,20 @@ from l402_requests.budget import BudgetController
 from l402_requests.challenge import (
     L402Challenge,
     MppChallenge,
+    MppDraft00Challenge,
+    build_payment_credential,
     find_payment_challenge,
 )
 from l402_requests.credential_cache import CredentialCache
 from l402_requests.exceptions import (
+    ChallengeExpiredError,
     InvoiceAmountUnknownError,
     L402Error,
     NoWalletError,
     PaymentFailedError,
     UnsupportedWalletError,
 )
+from l402_requests.receipt import parse_payment_receipt
 from l402_requests.spending_log import SpendingLog
 from l402_requests.wallets import WalletBase, auto_detect_wallet
 
@@ -34,7 +38,8 @@ def _select_challenge(response: httpx.Response) -> L402Challenge | MppChallenge 
 
     HTTP allows multiple ``WWW-Authenticate`` headers, so every value is tried
     rather than just the first — otherwise a valid challenge can be discarded.
-    L402 is preferred over MPP.
+    Preference order: L402 over Payment (unchanged), and within Payment the
+    modern draft-00 profile over the legacy one.
 
     Shared by both clients: see ``_resolve_amount_sats`` for why.
 
@@ -45,16 +50,81 @@ def _select_challenge(response: httpx.Response) -> L402Challenge | MppChallenge 
     if not www_auth_values:
         return None
 
-    # Try L402 first (preferred), then MPP
-    sorted_values = sorted(
-        www_auth_values,
-        key=lambda v: 0 if v.lower().lstrip().startswith("l402") else 1,
-    )
-    for value in sorted_values:
+    l402: L402Challenge | None = None
+    modern: MppDraft00Challenge | None = None
+    legacy: MppChallenge | None = None
+    for value in www_auth_values:
         candidate = find_payment_challenge({"www-authenticate": value})
-        if candidate is not None:
-            return candidate
-    return None
+        if candidate is None:
+            continue
+        if isinstance(candidate, L402Challenge):
+            if l402 is None:
+                l402 = candidate
+        elif isinstance(candidate, MppDraft00Challenge):
+            if modern is None:
+                modern = candidate
+        elif legacy is None:
+            legacy = candidate
+
+    if l402 is not None:
+        return l402
+    if modern is not None:
+        return modern
+    return legacy
+
+
+def _refuse_expired_challenge(challenge: L402Challenge | MppChallenge) -> None:
+    """Refuse a modern challenge whose ``expires`` is already past.
+
+    Checked BEFORE paying: an expired challenge can no longer settle
+    server-side, so paying its invoice would spend funds for no access.
+
+    Raises:
+        ChallengeExpiredError: If the challenge is a modern draft-00 one and
+            its expiry has passed.
+    """
+    if isinstance(challenge, MppDraft00Challenge) and challenge.is_expired():
+        raise ChallengeExpiredError(challenge.expires)
+
+
+def _authorization_header_for(
+    challenge: L402Challenge | MppChallenge,
+    preimage: str,
+    cache: CredentialCache,
+    domain: str,
+    path: str,
+) -> str:
+    """Build the retry ``Authorization`` header value for a paid challenge.
+
+    Modern draft-00 credentials are SINGLE-USE server-side, so they are never
+    put in the credential cache — replaying one buys nothing, and serving it
+    from cache would burn a request on a guaranteed 402.  L402 and legacy MPP
+    credentials keep the existing cache behavior (the cached credential is the
+    single source of truth for header formatting).
+    """
+    if isinstance(challenge, MppDraft00Challenge):
+        return build_payment_credential(challenge, preimage)
+    if isinstance(challenge, MppChallenge):
+        cached = cache.put(domain=domain, path=path, macaroon=None, preimage=preimage)
+    else:
+        cached = cache.put(
+            domain=domain, path=path, macaroon=challenge.macaroon, preimage=preimage
+        )
+    return cached.authorization_header
+
+
+def _attach_payment_receipt(response: httpx.Response) -> httpx.Response:
+    """Expose the server's ``Payment-Receipt`` header on the response.
+
+    Parsed tolerantly: ``response.payment_receipt`` is a
+    :class:`~l402_requests.receipt.PaymentReceipt` when the server sent a
+    usable receipt (draft-00), else None — a malformed or absent receipt
+    never fails an already-successful payment.
+    """
+    response.payment_receipt = parse_payment_receipt(  # type: ignore[attr-defined]
+        response.headers.get("payment-receipt")
+    )
+    return response
 
 
 def _resolve_amount_sats(challenge: L402Challenge | MppChallenge) -> int | None:
@@ -199,6 +269,10 @@ class L402Client:
             if challenge is None:
                 return response  # 402 but no recognized challenge — return as-is
 
+            # An expired draft-00 challenge can no longer settle — refuse
+            # before paying rather than spending funds for no access.
+            _refuse_expired_challenge(challenge)
+
             # Extract amount and check budget
             amount_sats = _resolve_amount_sats(challenge)
             parsed_url = urlparse(url)
@@ -274,27 +348,17 @@ class L402Client:
                 macaroon=challenge_macaroon,
             )
 
-            # Cache the credential and reuse its authorization_header
-            # as single source of truth for header formatting.
-            if isinstance(challenge, MppChallenge):
-                cached = self._cache.put(
-                    domain=domain,
-                    path=parsed_url.path,
-                    macaroon=None,
-                    preimage=preimage,
-                )
-            else:
-                cached = self._cache.put(
-                    domain=domain,
-                    path=parsed_url.path,
-                    macaroon=challenge.macaroon,
-                    preimage=preimage,
-                )
+            # Build the retry credential.  L402 and legacy MPP credentials go
+            # through the cache (single source of truth for header
+            # formatting); modern draft-00 credentials are single-use and are
+            # never cached.
+            headers["Authorization"] = _authorization_header_for(
+                challenge, preimage, self._cache, domain, parsed_url.path
+            )
 
-            # Retry with authorization from the cached credential
-            headers["Authorization"] = cached.authorization_header
+            # Retry with the fresh credential, surfacing any Payment-Receipt.
             retry_response = client.request(method, url, headers=headers, **kwargs)
-            return retry_response
+            return _attach_payment_receipt(retry_response)
 
     def get(self, url: str, **kwargs: Any) -> httpx.Response:
         return self.request("GET", url, **kwargs)
@@ -385,6 +449,10 @@ class AsyncL402Client:
         if challenge is None:
             return response
 
+        # An expired draft-00 challenge can no longer settle — refuse before
+        # paying rather than spending funds for no access.
+        _refuse_expired_challenge(challenge)
+
         amount_sats = _resolve_amount_sats(challenge)
         parsed_url = urlparse(url)
         domain = parsed_url.hostname or ""
@@ -459,27 +527,16 @@ class AsyncL402Client:
             macaroon=challenge_macaroon,
         )
 
-        # Cache the credential and reuse its authorization_header
-        # as single source of truth for header formatting.
-        if isinstance(challenge, MppChallenge):
-            cached = self._cache.put(
-                domain=domain,
-                path=parsed_url.path,
-                macaroon=None,
-                preimage=preimage,
-            )
-        else:
-            cached = self._cache.put(
-                domain=domain,
-                path=parsed_url.path,
-                macaroon=challenge.macaroon,
-                preimage=preimage,
-            )
+        # Build the retry credential.  L402 and legacy MPP credentials go
+        # through the cache (single source of truth for header formatting);
+        # modern draft-00 credentials are single-use and are never cached.
+        headers["Authorization"] = _authorization_header_for(
+            challenge, preimage, self._cache, domain, parsed_url.path
+        )
 
-        # Retry with authorization from the cached credential
-        headers["Authorization"] = cached.authorization_header
+        # Retry with the fresh credential, surfacing any Payment-Receipt.
         retry_response = await client.request(method, url, headers=headers, **kwargs)
-        return retry_response
+        return _attach_payment_receipt(retry_response)
 
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("GET", url, **kwargs)

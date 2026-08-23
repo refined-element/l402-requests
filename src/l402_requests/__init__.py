@@ -22,6 +22,8 @@ Usage:
 from l402_requests.budget import BudgetController
 from l402_requests.challenge import (
     MppChallenge,
+    MppDraft00Challenge,
+    build_payment_credential,
     find_l402_challenge,
     find_payment_challenge,
     parse_mpp_challenge,
@@ -30,6 +32,7 @@ from l402_requests.client import AsyncL402Client, L402Client
 from l402_requests.credential_cache import CredentialCache, L402Credential
 from l402_requests.exceptions import (
     BudgetExceededError,
+    ChallengeExpiredError,
     ChallengeParseError,
     DomainNotAllowedError,
     InvoiceAmountUnknownError,
@@ -39,6 +42,7 @@ from l402_requests.exceptions import (
     PaymentFailedError,
     UnsupportedWalletError,
 )
+from l402_requests.receipt import PaymentReceipt, parse_payment_receipt
 from l402_requests.spending_log import SpendingLog
 from l402_requests.wallets import (
     LndWallet,
@@ -59,9 +63,14 @@ __all__ = [
     "BudgetController",
     # Challenge parsing
     "MppChallenge",
+    "MppDraft00Challenge",
     "parse_mpp_challenge",
     "find_payment_challenge",
     "find_l402_challenge",
+    "build_payment_credential",
+    # Receipts
+    "PaymentReceipt",
+    "parse_payment_receipt",
     # Wallets
     "WalletBase",
     "StrikeWallet",
@@ -80,6 +89,7 @@ __all__ = [
     "PaymentFailedError",
     "InvoiceExpiredError",
     "InvoiceAmountUnknownError",
+    "ChallengeExpiredError",
     "ChallengeParseError",
     "NoWalletError",
     "UnsupportedWalletError",
