@@ -19,6 +19,7 @@ Usage:
     response = client.get("https://api.example.com/paid-resource")
 """
 
+from l402_requests._version import USER_AGENT, __version__
 from l402_requests.budget import BudgetController
 from l402_requests.challenge import (
     MppChallenge,
@@ -53,9 +54,10 @@ from l402_requests.wallets import (
     auto_detect_wallet,
 )
 
-__version__ = "0.8.0"
-
 __all__ = [
+    # Version
+    "__version__",
+    "USER_AGENT",
     # Clients
     "L402Client",
     "AsyncL402Client",

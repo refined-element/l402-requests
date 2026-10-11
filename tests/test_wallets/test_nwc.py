@@ -371,17 +371,18 @@ class TestNip04RoundTrip:
 
 
 class TestVersion:
-    def test_version_matches_package_metadata(self):
-        import importlib.metadata
+    def test_fallback_version_matches_pyproject(self):
+        # __version__ comes from package metadata when installed, so the only
+        # literal that can drift is the uninstalled-checkout fallback. Pin it to
+        # pyproject.toml, the single source of truth.
+        from pathlib import Path
 
-        import l402_requests
+        tomllib = pytest.importorskip("tomllib")  # stdlib from Python 3.11
 
-        try:
-            installed_version = importlib.metadata.version("l402-requests")
-        except importlib.metadata.PackageNotFoundError:
-            pytest.skip(
-                "l402-requests is not pip-installed in this environment "
-                "(run `pip install -e .` to exercise this check)"
-            )
+        from l402_requests import _version
 
-        assert l402_requests.__version__ == installed_version
+        pyproject = Path(_version.__file__).resolve().parents[2] / "pyproject.toml"
+        with pyproject.open("rb") as f:
+            data = tomllib.load(f)
+
+        assert _version._FALLBACK_VERSION == data["project"]["version"]

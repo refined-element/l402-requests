@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Versioned `User-Agent`**: every HTTP request the library sends (the request that receives the 402, the paid retry, and the Strike, OpenNode and LND wallet API calls; NWC uses a WebSocket and doesn't send it) now carries `User-Agent: l402-requests/<version>`, read from the installed package metadata. A `User-Agent` you set per request or through the client's `headers=` still wins. `__version__` now comes from package metadata, and `USER_AGENT` is exported.
+
 ## 0.8.0
 
 **MPP draft-00 client support** (draft-ryan-httpauth-payment-00 + draft-lightning-charge-00), additive interop with third-party MPP servers. Existing L402 and legacy `Payment` behavior is unchanged.
