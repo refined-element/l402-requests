@@ -7,6 +7,7 @@ import ssl
 
 import httpx
 
+from l402_requests._version import USER_AGENT
 from l402_requests.exceptions import PaymentFailedError
 from l402_requests.wallets import WalletBase
 
@@ -39,7 +40,10 @@ class LndWallet(WalletBase):
 
         return httpx.AsyncClient(
             base_url=self._host,
-            headers={"Grpc-Metadata-macaroon": self._macaroon_hex},
+            headers={
+                "Grpc-Metadata-macaroon": self._macaroon_hex,
+                "User-Agent": USER_AGENT,
+            },
             verify=verify,
             timeout=60.0,
         )

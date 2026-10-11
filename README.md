@@ -150,6 +150,8 @@ print(client.spending_log.to_json())
    - The request is retried with `Authorization: L402 {macaroon}:{preimage}`
 4. Credentials are cached so subsequent requests to the same endpoint don't require re-payment
 
+Every request the library sends, including the paid retry and the wallet's own API calls, carries `User-Agent: l402-requests/<version>`. To send your own, pass a `User-Agent` header per request or through `headers=` on the client.
+
 ## Two-Step L402 Flows (Commerce)
 
 Some servers intentionally use a two-step L402 flow where payment and claim are separate endpoints. This is common for physical goods — it separates payment from fulfillment and allows the claim URL to be shared with a gift recipient.

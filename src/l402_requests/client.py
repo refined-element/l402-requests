@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from l402_requests._version import with_default_user_agent
 from l402_requests.bolt11 import classify_missing_amount, extract_amount_sats
 from l402_requests.budget import BudgetController
 from l402_requests.challenge import (
@@ -232,6 +233,10 @@ class L402Client:
         self._wallet = wallet
         self._budget = BudgetController() if budget is ... else budget
         self._cache = credential_cache or CredentialCache()
+        # Default User-Agent on the underlying httpx client, so the initial request,
+        # the paid retry, and every other request carry it. A User-Agent in
+        # httpx_kwargs["headers"] or in a per-request ``headers=`` wins.
+        httpx_kwargs["headers"] = with_default_user_agent(httpx_kwargs.get("headers"))
         self._httpx_kwargs = httpx_kwargs
         self.spending_log = SpendingLog()
 
@@ -400,6 +405,10 @@ class AsyncL402Client:
         self._wallet = wallet
         self._budget = BudgetController() if budget is ... else budget
         self._cache = credential_cache or CredentialCache()
+        # Default User-Agent on the underlying httpx client, so the initial request,
+        # the paid retry, and every other request carry it. A User-Agent in
+        # httpx_kwargs["headers"] or in a per-request ``headers=`` wins.
+        httpx_kwargs["headers"] = with_default_user_agent(httpx_kwargs.get("headers"))
         self._httpx_kwargs = httpx_kwargs
         self._client: httpx.AsyncClient | None = None
         self.spending_log = SpendingLog()

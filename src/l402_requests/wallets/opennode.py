@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 
+from l402_requests._version import USER_AGENT
 from l402_requests.exceptions import PaymentFailedError
 from l402_requests.wallets import WalletBase
 
@@ -32,6 +33,7 @@ class OpenNodeWallet(WalletBase):
             headers={
                 "Authorization": self._api_key,
                 "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
             },
             timeout=60.0,
         )
