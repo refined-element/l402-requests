@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **Versioned `User-Agent`**: every HTTP request the library sends (the request that receives the 402, the paid retry, and the Strike, OpenNode, and LND wallet API calls) now carries `User-Agent: l402-requests/<version>`, read from the installed package metadata. A `User-Agent` you set per request or through the client's `headers=` still wins. `__version__` now comes from package metadata, and `USER_AGENT` is exported.
+- **Versioned `User-Agent`**: every HTTP request the library sends (the request that receives the 402, the paid retry, and the Strike, OpenNode and LND wallet API calls; NWC uses a WebSocket and doesn't send it) now carries `User-Agent: l402-requests/<version>`, read from the installed package metadata. A `User-Agent` you set per request or through the client's `headers=` still wins. `__version__` now comes from package metadata, and `USER_AGENT` is exported.
 
 ## 0.8.0
 
