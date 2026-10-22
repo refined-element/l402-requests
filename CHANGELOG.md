@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 (2026-10-22)
+
+- **CI installer hardening** (no library change): every workflow job that installs with pip first runs a hash-pinned bootstrap (pip 26.2.2 and certifi 2026.10.19, SHA256-verified, installed from the verified wheel, never through the runner's pre-installed pip) and fails unless those versions are in place; a stdlib-only test pins the workflows. Part of the 2026-10-22 eMudhra CA / installer remediation.
 
 - **Versioned `User-Agent`**: every HTTP request the library sends (the request that receives the 402, the paid retry, and the Strike, OpenNode and LND wallet API calls; NWC uses a WebSocket and doesn't send it) now carries `User-Agent: l402-requests/<version>`, read from the installed package metadata. A `User-Agent` you set per request or through the client's `headers=` still wins. `__version__` now comes from package metadata, and `USER_AGENT` is exported.
 

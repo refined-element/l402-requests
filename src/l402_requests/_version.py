@@ -16,7 +16,7 @@ import httpx
 # Used only when running from a source checkout that was never pip-installed;
 # installed copies always read the version from package metadata, so it can't
 # drift from pyproject.toml (the single source of truth).
-_FALLBACK_VERSION = "0.8.0"
+_FALLBACK_VERSION = "0.9.0"
 
 try:
     __version__ = _pkg_version("l402-requests")
