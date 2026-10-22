@@ -38,8 +38,11 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      - name: Bootstrap trusted pip and certifi (hash-pinned, before any install)
+        uses: ./.github/actions/trusted-pip
+
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: python -m pip install -e ".[dev]"
 
       - name: Run tests
         run: python -m pytest tests/ -v
